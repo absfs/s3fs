@@ -2,6 +2,7 @@ package s3fs
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -11,6 +12,9 @@ import (
 )
 
 // File represents a file in S3.
+// It implements the absfs.File interface for S3 object operations.
+// Files are opened in either read or write mode. Write mode uses an in-memory
+// buffer that is uploaded to S3 on Close().
 type File struct {
 	fs      *FileSystem
 	name    string
@@ -27,9 +31,11 @@ func (f *File) Name() string {
 }
 
 // Read reads from the S3 object.
+// On the first call, it fetches the object from S3 and reads from the response body.
+// Subsequent calls continue reading from the same response stream.
 func (f *File) Read(b []byte) (int, error) {
 	if f.writing {
-		return 0, os.ErrInvalid
+		return 0, ErrReadOnWriteFile
 	}
 
 	// Lazy load the object body
@@ -39,39 +45,51 @@ func (f *File) Read(b []byte) (int, error) {
 			Key:    aws.String(f.key),
 		})
 		if err != nil {
-			return 0, err
+			return 0, wrapError("Read", f.name, err)
 		}
 		f.body = output.Body
 	}
 
-	return f.body.Read(b)
+	n, err := f.body.Read(b)
+	if err != nil && err != io.EOF {
+		return n, wrapError("Read", f.name, err)
+	}
+	return n, err
 }
 
 // ReadAt reads from the S3 object at a specific offset.
+// It uses S3's Range header to read only the requested bytes.
+// Each call makes a separate request to S3.
 func (f *File) ReadAt(b []byte, off int64) (int, error) {
 	if f.writing {
-		return 0, os.ErrInvalid
+		return 0, ErrReadOnWriteFile
 	}
 
 	// S3 supports range reads
-	rangeStr := aws.String("bytes=" + string(rune(off)) + "-" + string(rune(off+int64(len(b))-1)))
+	rangeStr := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(b))-1)
 	output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.fs.bucket),
 		Key:    aws.String(f.key),
-		Range:  rangeStr,
+		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
-		return 0, err
+		return 0, wrapError("ReadAt", f.name, err)
 	}
 	defer output.Body.Close()
 
-	return io.ReadFull(output.Body, b)
+	n, err := io.ReadFull(output.Body, b)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return n, wrapError("ReadAt", f.name, err)
+	}
+	return n, err
 }
 
 // Write writes to the file buffer (will be uploaded on Close).
+// Data is buffered in memory until Close() is called, which uploads the entire
+// buffer to S3 in a single operation.
 func (f *File) Write(b []byte) (int, error) {
 	if !f.writing {
-		return 0, os.ErrInvalid
+		return 0, ErrWriteOnReadFile
 	}
 
 	f.buffer = append(f.buffer, b...)
@@ -80,9 +98,10 @@ func (f *File) Write(b []byte) (int, error) {
 }
 
 // WriteAt writes to the buffer at a specific offset.
+// The buffer is automatically expanded if the write extends beyond its current size.
 func (f *File) WriteAt(b []byte, off int64) (int, error) {
 	if !f.writing {
-		return 0, os.ErrInvalid
+		return 0, ErrWriteOnReadFile
 	}
 
 	// Extend buffer if necessary
@@ -102,6 +121,8 @@ func (f *File) WriteString(s string) (int, error) {
 }
 
 // Close closes the file and uploads to S3 if writing.
+// For write mode files, this uploads the entire buffer to S3.
+// For read mode files, this closes the response body.
 func (f *File) Close() error {
 	if f.body != nil {
 		f.body.Close()
@@ -114,13 +135,17 @@ func (f *File) Close() error {
 			Key:    aws.String(f.key),
 			Body:   bytes.NewReader(f.buffer),
 		})
-		return err
+		if err != nil {
+			return wrapError("Close", f.name, err)
+		}
 	}
 
 	return nil
 }
 
 // Seek seeks within the file.
+// Note: This is a simplified implementation. For S3, seeking is limited and
+// io.SeekEnd is not supported as it would require knowing the file size.
 func (f *File) Seek(offset int64, whence int) (int64, error) {
 	// For S3, seeking is limited. This is a simplified implementation.
 	switch whence {
@@ -130,7 +155,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 		f.offset += offset
 	case io.SeekEnd:
 		// Would need to know file size
-		return 0, os.ErrInvalid
+		return 0, ErrInvalidSeek
 	}
 	return f.offset, nil
 }
@@ -140,15 +165,18 @@ func (f *File) Stat() (os.FileInfo, error) {
 	return f.fs.Stat(f.name)
 }
 
-// Sync is a no-op for S3 (writes are synchronous).
+// Sync is a no-op for S3.
+// All writes are buffered until Close(), at which point they are synchronously uploaded.
 func (f *File) Sync() error {
 	return nil
 }
 
-// Truncate truncates the file.
+// Truncate changes the size of the file buffer.
+// If size is smaller than the current buffer, data is truncated.
+// If size is larger, the buffer is extended with zero bytes.
 func (f *File) Truncate(size int64) error {
 	if !f.writing {
-		return os.ErrInvalid
+		return ErrWriteOnReadFile
 	}
 
 	if size < int64(len(f.buffer)) {
@@ -162,6 +190,8 @@ func (f *File) Truncate(size int64) error {
 }
 
 // Readdir reads directory entries (lists objects with prefix).
+// In S3, "directories" are represented by objects with keys that have the directory
+// as a prefix. If n > 0, at most n entries are returned.
 func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 	prefix := f.key
 	if !strings.HasSuffix(prefix, "/") {
@@ -173,7 +203,7 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 		Prefix: aws.String(prefix),
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError("Readdir", f.name, err)
 	}
 
 	var infos []os.FileInfo
@@ -194,6 +224,7 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 }
 
 // Readdirnames reads directory entry names.
+// It returns the names of up to n entries in the directory.
 func (f *File) Readdirnames(n int) ([]string, error) {
 	infos, err := f.Readdir(n)
 	if err != nil {
