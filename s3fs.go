@@ -57,6 +57,9 @@ func New(cfg *Config) (*FileSystem, error) {
 
 // OpenFile opens a file in S3.
 // Note: S3 doesn't support traditional file flags, so this is a simplified implementation.
+// Files opened with O_WRONLY, O_RDWR, or O_CREATE are opened in write mode and buffer
+// data in memory until Close(). Files opened with O_RDONLY are opened in read mode and
+// stream data from S3.
 func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
 	name = strings.TrimPrefix(name, "/")
 
@@ -81,6 +84,8 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 }
 
 // Mkdir creates a "directory" in S3 (creates a zero-byte object with trailing slash).
+// S3 doesn't have real directories, but this creates a marker object to represent one.
+// The perm parameter is ignored as S3 doesn't support POSIX permissions.
 func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 	name = strings.TrimPrefix(name, "/")
 	if !strings.HasSuffix(name, "/") {
@@ -92,10 +97,14 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 		Key:    aws.String(name),
 		Body:   strings.NewReader(""),
 	})
-	return err
+	if err != nil {
+		return wrapError("Mkdir", name, err)
+	}
+	return nil
 }
 
 // Remove removes a file from S3.
+// This deletes the S3 object with the given key.
 func (fs *FileSystem) Remove(name string) error {
 	name = strings.TrimPrefix(name, "/")
 
@@ -103,10 +112,16 @@ func (fs *FileSystem) Remove(name string) error {
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
-	return err
+	if err != nil {
+		return wrapError("Remove", name, err)
+	}
+	return nil
 }
 
 // Rename renames (moves) a file in S3 by copying and deleting.
+// Since S3 doesn't support atomic rename, this operation copies the object to the
+// new location and then deletes the original. This is not atomic and may fail
+// partway through.
 func (fs *FileSystem) Rename(oldpath, newpath string) error {
 	oldpath = strings.TrimPrefix(oldpath, "/")
 	newpath = strings.TrimPrefix(newpath, "/")
@@ -118,7 +133,7 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 		Key:        aws.String(newpath),
 	})
 	if err != nil {
-		return err
+		return wrapError("Rename", oldpath, err)
 	}
 
 	// Delete old object
@@ -126,10 +141,14 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(oldpath),
 	})
-	return err
+	if err != nil {
+		return wrapError("Rename", oldpath, err)
+	}
+	return nil
 }
 
 // Stat returns file info for an S3 object.
+// It uses HeadObject to retrieve metadata without downloading the object content.
 func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 	name = strings.TrimPrefix(name, "/")
 
@@ -138,7 +157,7 @@ func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 		Key:    aws.String(name),
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError("Stat", name, err)
 	}
 
 	return &fileInfo{
@@ -150,16 +169,20 @@ func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 }
 
 // Chmod is not supported for S3.
+// S3 doesn't have POSIX file permissions, so this always returns ErrNotImplemented.
 func (fs *FileSystem) Chmod(name string, mode os.FileMode) error {
 	return absfs.ErrNotImplemented
 }
 
 // Chtimes is not supported for S3.
+// S3 object modification times are managed by the service and cannot be changed,
+// so this always returns ErrNotImplemented.
 func (fs *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	return absfs.ErrNotImplemented
 }
 
 // Chown is not supported for S3.
+// S3 doesn't have POSIX ownership, so this always returns ErrNotImplemented.
 func (fs *FileSystem) Chown(name string, uid, gid int) error {
 	return absfs.ErrNotImplemented
 }
