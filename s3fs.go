@@ -129,7 +129,7 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 	// Copy object to new location
 	_, err := fs.client.CopyObject(fs.ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(fs.bucket),
-		CopySource: aws.String(path.Join(fs.bucket, oldpath)),
+		CopySource: aws.String("/" + fs.bucket + "/" + oldpath),
 		Key:        aws.String(newpath),
 	})
 	if err != nil {
