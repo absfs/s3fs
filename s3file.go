@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -208,10 +209,20 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 
 	var infos []os.FileInfo
 	for _, obj := range output.Contents {
+		var size int64
+		if obj.Size != nil {
+			size = *obj.Size
+		}
+
+		var modTime time.Time
+		if obj.LastModified != nil {
+			modTime = *obj.LastModified
+		}
+
 		infos = append(infos, &fileInfo{
 			name:    aws.ToString(obj.Key),
-			size:    *obj.Size,
-			modTime: *obj.LastModified,
+			size:    size,
+			modTime: modTime,
 			isDir:   strings.HasSuffix(aws.ToString(obj.Key), "/"),
 		})
 

@@ -160,10 +160,20 @@ func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 		return nil, wrapError("Stat", name, err)
 	}
 
+	var size int64
+	if output.ContentLength != nil {
+		size = *output.ContentLength
+	}
+
+	var modTime time.Time
+	if output.LastModified != nil {
+		modTime = *output.LastModified
+	}
+
 	return &fileInfo{
 		name:    path.Base(name),
-		size:    *output.ContentLength,
-		modTime: *output.LastModified,
+		size:    size,
+		modTime: modTime,
 		isDir:   strings.HasSuffix(name, "/"),
 	}, nil
 }
