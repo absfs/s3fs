@@ -2,6 +2,7 @@ package s3fs
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -54,7 +55,7 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 	}
 
 	// S3 supports range reads
-	rangeStr := aws.String("bytes=" + string(rune(off)) + "-" + string(rune(off+int64(len(b))-1)))
+	rangeStr := aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(len(b))-1))
 	output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.fs.bucket),
 		Key:    aws.String(f.key),

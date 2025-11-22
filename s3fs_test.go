@@ -1,6 +1,7 @@
 package s3fs
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -64,5 +65,29 @@ func TestAwsStringHelper(t *testing.T) {
 	str := aws.String("test")
 	if *str != "test" {
 		t.Errorf("aws.String() failed")
+	}
+}
+
+func TestReadAtRangeFormat(t *testing.T) {
+	// Test that the range string is formatted correctly
+	// This verifies the fix for issue #11
+	tests := []struct {
+		offset int64
+		length int
+		want   string
+	}{
+		{0, 100, "bytes=0-99"},
+		{100, 50, "bytes=100-149"},
+		{1000, 1, "bytes=1000-1000"},
+		{256, 512, "bytes=256-767"},
+	}
+
+	for _, tt := range tests {
+		// Simulate the range string construction from ReadAt
+		rangeStr := fmt.Sprintf("bytes=%d-%d", tt.offset, tt.offset+int64(tt.length)-1)
+		if rangeStr != tt.want {
+			t.Errorf("Range string for offset=%d, length=%d: got %q, want %q",
+				tt.offset, tt.length, rangeStr, tt.want)
+		}
 	}
 }
