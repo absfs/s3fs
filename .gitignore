@@ -2,3 +2,6 @@
 *.out
 coverage.out
 vendor/
+.claude/
+CLAUDE.md
+.project_meta/
