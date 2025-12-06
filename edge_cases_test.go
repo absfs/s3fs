@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -233,18 +234,26 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 
 func TestErrorPropagation_GetObject(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create the file first so OpenFile succeeds
+	mock.PutTestObject("file.txt", []byte("test data"))
+
 	testErr := errors.New("GetObject network error")
 	mock.GetObjectErr = testErr
 
-	f, _ := fs.OpenFile("file.txt", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("file.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	buf := make([]byte, 10)
-	_, err := f.Read(buf)
+	_, err = f.Read(buf)
 	if err == nil {
 		t.Error("Expected error from Read")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
@@ -260,8 +269,9 @@ func TestErrorPropagation_PutObject(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error from Close")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
@@ -274,29 +284,42 @@ func TestErrorPropagation_HeadObject(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error from Stat")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
 func TestErrorPropagation_ListObjects(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create a directory marker so OpenFile succeeds
+	mock.PutTestObject("dir/", []byte(""))
+
 	testErr := errors.New("ListObjects throttled")
 	mock.ListObjectsErr = testErr
 
-	f, _ := fs.OpenFile("dir", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
-	_, err := f.Readdir(-1)
+	_, err = f.Readdir(-1)
 	if err == nil {
 		t.Error("Expected error from Readdir")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
 func TestErrorPropagation_DeleteObject(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create the file first so Remove can check it exists
+	mock.PutTestObject("file.txt", []byte("data"))
+
 	testErr := errors.New("DeleteObject access denied")
 	mock.DeleteObjectErr = testErr
 
@@ -304,8 +327,9 @@ func TestErrorPropagation_DeleteObject(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error from Remove")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
@@ -319,8 +343,9 @@ func TestErrorPropagation_CopyObject(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error from Rename")
 	}
-	if err.Error() != testErr.Error() {
-		t.Errorf("Error = %q, want %q", err.Error(), testErr.Error())
+	// Error is now wrapped in PathError
+	if !strings.Contains(err.Error(), testErr.Error()) {
+		t.Errorf("Error = %q, want to contain %q", err.Error(), testErr.Error())
 	}
 }
 
@@ -393,14 +418,14 @@ func TestMockClient_CallTracking(t *testing.T) {
 	mock.PutTestObject("test.txt", []byte("data"))
 
 	// Perform various operations
-	fs.Stat("test.txt")
-	fs.Stat("other.txt") // Will fail but still tracked
+	fs.Stat("test.txt")                          // HeadObject call 1
+	fs.Stat("other.txt")                         // HeadObject call 2 (will fail but still tracked)
+	f, _ := fs.OpenFile("test.txt", os.O_RDONLY, 0) // HeadObject call 3 (verifies file exists)
+	f.Read(make([]byte, 10))                    // GetObject call 1
 
-	f, _ := fs.OpenFile("test.txt", os.O_RDONLY, 0)
-	f.Read(make([]byte, 10))
-
-	if len(mock.HeadObjectCalls) != 2 {
-		t.Errorf("HeadObjectCalls = %d, want 2", len(mock.HeadObjectCalls))
+	// OpenFile now verifies file exists, so we have 3 HeadObject calls instead of 2
+	if len(mock.HeadObjectCalls) != 3 {
+		t.Errorf("HeadObjectCalls = %d, want 3", len(mock.HeadObjectCalls))
 	}
 
 	if len(mock.GetObjectCalls) != 1 {

@@ -4,6 +4,7 @@ package s3fs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // FileSystem implements absfs.Filer for S3 object storage.
@@ -74,13 +76,64 @@ func NewWithClientAndContext(ctx context.Context, client S3Client, bucket string
 	}
 }
 
+// wrapError wraps S3 errors to be compatible with os.IsNotExist and os.IsExist.
+func wrapError(op, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Check for NoSuchKey error
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return &os.PathError{Op: op, Path: path, Err: os.ErrNotExist}
+	}
+
+	// For other errors, wrap them in PathError
+	return &os.PathError{Op: op, Path: path, Err: err}
+}
+
 // OpenFile opens a file in S3.
 // Note: S3 doesn't support traditional file flags, so this is a simplified implementation.
 func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
 	name = strings.TrimPrefix(name, "/")
 
+	// Check if O_EXCL is set - file must not exist
+	if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
+		_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(name),
+		})
+		if err == nil {
+			// File exists, return error
+			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrExist}
+		}
+		// File doesn't exist, which is what we want for O_EXCL
+		var noSuchKey *types.NoSuchKey
+		if !errors.As(err, &noSuchKey) {
+			// Some other error occurred
+			return nil, wrapError("open", name, err)
+		}
+	}
+
 	// For write operations
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+		// Check if trying to write to a directory
+		// Directories in S3 are marked with trailing slash
+		dirKey := name
+		if !strings.HasSuffix(dirKey, "/") {
+			dirKey += "/"
+		}
+
+		output, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(dirKey),
+		})
+		if err == nil {
+			// Directory exists
+			_ = output
+			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrInvalid}
+		}
+
 		return &File{
 			fs:      fs,
 			name:    name,
@@ -90,7 +143,15 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 		}, nil
 	}
 
-	// For read operations, get the object
+	// For read operations, verify the file exists
+	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+	if err != nil {
+		return nil, wrapError("open", name, err)
+	}
+
 	return &File{
 		fs:      fs,
 		name:    name,
@@ -106,23 +167,48 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 		name += "/"
 	}
 
-	_, err := fs.client.PutObject(fs.ctx, &s3.PutObjectInput{
+	// Check if directory already exists
+	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+	if err == nil {
+		// Directory already exists
+		return &os.PathError{Op: "mkdir", Path: name, Err: os.ErrExist}
+	}
+
+	// Only proceed if error is NoSuchKey
+	var noSuchKey *types.NoSuchKey
+	if !errors.As(err, &noSuchKey) {
+		return wrapError("mkdir", name, err)
+	}
+
+	_, err = fs.client.PutObject(fs.ctx, &s3.PutObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 		Body:   strings.NewReader(""),
 	})
-	return err
+	return wrapError("mkdir", name, err)
 }
 
 // Remove removes a file from S3.
 func (fs *FileSystem) Remove(name string) error {
 	name = strings.TrimPrefix(name, "/")
 
-	_, err := fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+	// Check if the file exists first
+	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
-	return err
+	if err != nil {
+		return wrapError("remove", name, err)
+	}
+
+	_, err = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+	return wrapError("remove", name, err)
 }
 
 // Rename renames (moves) a file in S3 by copying and deleting.
@@ -139,7 +225,7 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 		Key:        aws.String(newpath),
 	})
 	if err != nil {
-		return err
+		return wrapError("rename", oldpath, err)
 	}
 
 	// Delete old object
@@ -147,7 +233,7 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(oldpath),
 	})
-	return err
+	return wrapError("rename", oldpath, err)
 }
 
 // Stat returns file info for an S3 object.
@@ -159,7 +245,7 @@ func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 		Key:    aws.String(name),
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError("stat", name, err)
 	}
 
 	// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime

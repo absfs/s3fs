@@ -40,7 +40,7 @@ func (f *File) Read(b []byte) (int, error) {
 			Key:    aws.String(f.key),
 		})
 		if err != nil {
-			return 0, err
+			return 0, wrapError("read", f.name, err)
 		}
 		f.body = output.Body
 	}
@@ -62,7 +62,7 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
-		return 0, err
+		return 0, wrapError("read", f.name, err)
 	}
 	defer output.Body.Close()
 
@@ -115,7 +115,7 @@ func (f *File) Close() error {
 			Key:    aws.String(f.key),
 			Body:   bytes.NewReader(f.buffer),
 		})
-		return err
+		return wrapError("close", f.name, err)
 	}
 
 	return nil
@@ -164,6 +164,24 @@ func (f *File) Truncate(size int64) error {
 
 // Readdir reads directory entries (lists objects with prefix).
 func (f *File) Readdir(n int) ([]os.FileInfo, error) {
+	// Check if this is a directory (or could be one)
+	// For read operations on files opened for reading, check if it's actually a directory marker
+	if !f.writing && f.body == nil {
+		// Check if the key exists and is a file (not a directory)
+		output, err := f.fs.client.HeadObject(f.fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.key),
+		})
+		if err == nil {
+			// Object exists and is a file (not ending in /)
+			if !strings.HasSuffix(f.key, "/") {
+				return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
+			}
+		}
+		// If object doesn't exist, that's ok - we'll try listing with prefix
+		_ = output
+	}
+
 	prefix := f.key
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
@@ -174,17 +192,23 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 		Prefix: aws.String(prefix),
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError("readdir", f.name, err)
 	}
 
 	var infos []os.FileInfo
 	for _, obj := range output.Contents {
+		key := aws.ToString(obj.Key)
+		// Skip the directory marker itself (e.g., "dir/" when listing "dir/")
+		if key == prefix {
+			continue
+		}
+
 		// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
 		infos = append(infos, &fileInfo{
-			name:    aws.ToString(obj.Key),
+			name:    key,
 			size:    aws.ToInt64(obj.Size),
 			modTime: aws.ToTime(obj.LastModified),
-			isDir:   strings.HasSuffix(aws.ToString(obj.Key), "/"),
+			isDir:   strings.HasSuffix(key, "/"),
 		})
 
 		if n > 0 && len(infos) >= n {

@@ -109,15 +109,13 @@ func TestRead_OnWriteModeFile_Error(t *testing.T) {
 func TestRead_FileNotFound(t *testing.T) {
 	fs, _ := newTestFS()
 
-	f, err := fs.OpenFile("not-found.txt", os.O_RDONLY, 0)
-	if err != nil {
-		t.Fatalf("OpenFile failed: %v", err)
-	}
-
-	buf := make([]byte, 10)
-	_, err = f.Read(buf)
+	// OpenFile now checks if file exists, so it should fail here
+	_, err := fs.OpenFile("not-found.txt", os.O_RDONLY, 0)
 	if err == nil {
-		t.Error("Expected error when reading non-existent file")
+		t.Error("Expected error when opening non-existent file")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("Expected os.IsNotExist error, got: %v", err)
 	}
 }
 
@@ -145,12 +143,19 @@ func TestRead_EOF(t *testing.T) {
 
 func TestRead_Error(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create the file first so OpenFile succeeds
+	mock.PutTestObject("error.txt", []byte("test"))
+
 	mock.GetObjectErr = errors.New("network error")
 
-	f, _ := fs.OpenFile("error.txt", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("error.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	buf := make([]byte, 10)
-	_, err := f.Read(buf)
+	_, err = f.Read(buf)
 	if err == nil {
 		t.Error("Expected error from Read")
 	}
@@ -212,12 +217,19 @@ func TestReadAt_OnWriteModeFile_Error(t *testing.T) {
 
 func TestReadAt_Error(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create the file first so OpenFile succeeds
+	mock.PutTestObject("error.txt", []byte("test"))
+
 	mock.GetObjectErr = errors.New("s3 error")
 
-	f, _ := fs.OpenFile("error.txt", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("error.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	buf := make([]byte, 10)
-	_, err := f.ReadAt(buf, 0)
+	_, err = f.ReadAt(buf, 0)
 	if err == nil {
 		t.Error("Expected error from ReadAt")
 	}
@@ -227,11 +239,15 @@ func TestReadAt_Error(t *testing.T) {
 
 func TestReaddir_Basic(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("dir/", []byte("")) // Create directory marker
 	mock.PutTestObject("dir/file1.txt", []byte("content1"))
 	mock.PutTestObject("dir/file2.txt", []byte("content2"))
 	mock.PutTestObject("dir/file3.txt", []byte("content3"))
 
-	f, _ := fs.OpenFile("dir", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	infos, err := f.Readdir(-1)
 	if err != nil {
@@ -245,12 +261,16 @@ func TestReaddir_Basic(t *testing.T) {
 
 func TestReaddir_WithLimit(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("limit-dir/", []byte("")) // Create directory marker
 	mock.PutTestObject("limit-dir/a.txt", []byte("a"))
 	mock.PutTestObject("limit-dir/b.txt", []byte("b"))
 	mock.PutTestObject("limit-dir/c.txt", []byte("c"))
 	mock.PutTestObject("limit-dir/d.txt", []byte("d"))
 
-	f, _ := fs.OpenFile("limit-dir", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("limit-dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	infos, err := f.Readdir(2)
 	if err != nil {
@@ -263,9 +283,15 @@ func TestReaddir_WithLimit(t *testing.T) {
 }
 
 func TestReaddir_EmptyDirectory(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
 
-	f, _ := fs.OpenFile("empty-dir", os.O_RDONLY, 0)
+	// Create empty directory marker
+	mock.PutTestObject("empty-dir/", []byte(""))
+
+	f, err := fs.OpenFile("empty-dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	infos, err := f.Readdir(-1)
 	if err != nil {
@@ -279,9 +305,13 @@ func TestReaddir_EmptyDirectory(t *testing.T) {
 
 func TestReaddir_PrefixHandling_WithTrailingSlash(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("slash/", []byte("")) // Create directory marker
 	mock.PutTestObject("slash/file.txt", []byte("data"))
 
-	f, _ := fs.OpenFile("slash/", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("slash/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	infos, err := f.Readdir(-1)
 	if err != nil {
@@ -295,9 +325,13 @@ func TestReaddir_PrefixHandling_WithTrailingSlash(t *testing.T) {
 
 func TestReaddir_PrefixHandling_WithoutTrailingSlash(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("noslash/", []byte("")) // Create directory marker
 	mock.PutTestObject("noslash/file.txt", []byte("data"))
 
-	f, _ := fs.OpenFile("noslash", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("noslash/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	infos, err := f.Readdir(-1)
 	if err != nil {
@@ -312,11 +346,18 @@ func TestReaddir_PrefixHandling_WithoutTrailingSlash(t *testing.T) {
 
 func TestReaddir_Error(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create directory marker
+	mock.PutTestObject("dir/", []byte(""))
+
 	mock.ListObjectsErr = errors.New("list error")
 
-	f, _ := fs.OpenFile("dir", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
-	_, err := f.Readdir(-1)
+	_, err = f.Readdir(-1)
 	if err == nil {
 		t.Error("Expected error from Readdir")
 	}
@@ -326,10 +367,14 @@ func TestReaddir_Error(t *testing.T) {
 
 func TestReaddirnames_Basic(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("names/", []byte("")) // Create directory marker
 	mock.PutTestObject("names/one.txt", []byte("1"))
 	mock.PutTestObject("names/two.txt", []byte("2"))
 
-	f, _ := fs.OpenFile("names", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("names/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	names, err := f.Readdirnames(-1)
 	if err != nil {
@@ -343,11 +388,15 @@ func TestReaddirnames_Basic(t *testing.T) {
 
 func TestReaddirnames_WithLimit(t *testing.T) {
 	fs, mock := newTestFS()
+	mock.PutTestObject("limit/", []byte("")) // Create directory marker
 	mock.PutTestObject("limit/a.txt", []byte("a"))
 	mock.PutTestObject("limit/b.txt", []byte("b"))
 	mock.PutTestObject("limit/c.txt", []byte("c"))
 
-	f, _ := fs.OpenFile("limit", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("limit/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	names, err := f.Readdirnames(1)
 	if err != nil {
@@ -361,11 +410,18 @@ func TestReaddirnames_WithLimit(t *testing.T) {
 
 func TestReaddirnames_ErrorPropagation(t *testing.T) {
 	fs, mock := newTestFS()
+
+	// Create directory marker
+	mock.PutTestObject("dir/", []byte(""))
+
 	mock.ListObjectsErr = errors.New("list error")
 
-	f, _ := fs.OpenFile("dir", os.O_RDONLY, 0)
+	f, err := fs.OpenFile("dir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
-	_, err := f.Readdirnames(-1)
+	_, err = f.Readdirnames(-1)
 	if err == nil {
 		t.Error("Expected error from Readdirnames")
 	}
@@ -870,9 +926,15 @@ func TestSync_ReadMode(t *testing.T) {
 // --- Name and Stat Tests ---
 
 func TestName(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
 
-	f, _ := fs.OpenFile("myfile.txt", os.O_RDONLY, 0)
+	// Create the file first
+	mock.PutTestObject("myfile.txt", []byte("test"))
+
+	f, err := fs.OpenFile("myfile.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	if f.Name() != "myfile.txt" {
 		t.Errorf("Name = %q, want %q", f.Name(), "myfile.txt")
@@ -880,9 +942,15 @@ func TestName(t *testing.T) {
 }
 
 func TestName_WithPath(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
 
-	f, _ := fs.OpenFile("path/to/file.txt", os.O_RDONLY, 0)
+	// Create the file first
+	mock.PutTestObject("path/to/file.txt", []byte("test"))
+
+	f, err := fs.OpenFile("path/to/file.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
 
 	if f.Name() != "path/to/file.txt" {
 		t.Errorf("Name = %q, want %q", f.Name(), "path/to/file.txt")
@@ -911,10 +979,12 @@ func TestFileStat(t *testing.T) {
 func TestFileStat_NotFound(t *testing.T) {
 	fs, _ := newTestFS()
 
-	f, _ := fs.OpenFile("notfound.txt", os.O_RDONLY, 0)
-
-	_, err := f.Stat()
+	// OpenFile now fails if file doesn't exist
+	_, err := fs.OpenFile("notfound.txt", os.O_RDONLY, 0)
 	if err == nil {
-		t.Error("Expected error for Stat on non-existent file")
+		t.Error("Expected error when opening non-existent file")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("Expected os.IsNotExist error, got: %v", err)
 	}
 }
