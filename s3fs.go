@@ -17,7 +17,7 @@ import (
 
 // FileSystem implements absfs.Filer for S3 object storage.
 type FileSystem struct {
-	client *s3.Client
+	client S3Client
 	bucket string
 	ctx    context.Context
 }
@@ -53,6 +53,25 @@ func New(cfg *Config) (*FileSystem, error) {
 		bucket: cfg.Bucket,
 		ctx:    ctx,
 	}, nil
+}
+
+// NewWithClient creates a new S3 filesystem with a custom S3 client.
+// This is primarily useful for testing with mock clients.
+func NewWithClient(client S3Client, bucket string) *FileSystem {
+	return &FileSystem{
+		client: client,
+		bucket: bucket,
+		ctx:    context.Background(),
+	}
+}
+
+// NewWithClientAndContext creates a new S3 filesystem with a custom S3 client and context.
+func NewWithClientAndContext(ctx context.Context, client S3Client, bucket string) *FileSystem {
+	return &FileSystem{
+		client: client,
+		bucket: bucket,
+		ctx:    ctx,
+	}
 }
 
 // OpenFile opens a file in S3.
@@ -112,9 +131,11 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 	newpath = strings.TrimPrefix(newpath, "/")
 
 	// Copy object to new location
+	// Issue #13 fix: CopySource must be in format /bucket/key (with leading slash)
+	copySource := "/" + fs.bucket + "/" + oldpath
 	_, err := fs.client.CopyObject(fs.ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(fs.bucket),
-		CopySource: aws.String(path.Join(fs.bucket, oldpath)),
+		CopySource: aws.String(copySource),
 		Key:        aws.String(newpath),
 	})
 	if err != nil {
@@ -141,10 +162,11 @@ func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 		return nil, err
 	}
 
+	// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
 	return &fileInfo{
 		name:    path.Base(name),
-		size:    *output.ContentLength,
-		modTime: *output.LastModified,
+		size:    aws.ToInt64(output.ContentLength),
+		modTime: aws.ToTime(output.LastModified),
 		isDir:   strings.HasSuffix(name, "/"),
 	}, nil
 }

@@ -2,6 +2,7 @@ package s3fs
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -53,12 +54,12 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 		return 0, os.ErrInvalid
 	}
 
-	// S3 supports range reads
-	rangeStr := aws.String("bytes=" + string(rune(off)) + "-" + string(rune(off+int64(len(b))-1)))
+	// S3 supports range reads - Issue #11 fix: use proper integer formatting
+	rangeStr := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(b))-1)
 	output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.fs.bucket),
 		Key:    aws.String(f.key),
-		Range:  rangeStr,
+		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
 		return 0, err
@@ -178,10 +179,11 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 
 	var infos []os.FileInfo
 	for _, obj := range output.Contents {
+		// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
 		infos = append(infos, &fileInfo{
 			name:    aws.ToString(obj.Key),
-			size:    *obj.Size,
-			modTime: *obj.LastModified,
+			size:    aws.ToInt64(obj.Size),
+			modTime: aws.ToTime(obj.LastModified),
 			isDir:   strings.HasSuffix(aws.ToString(obj.Key), "/"),
 		})
 
