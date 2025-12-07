@@ -196,6 +196,8 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 	}
 
 	var infos []os.FileInfo
+	seen := make(map[string]bool) // Track entries we've already added
+
 	for _, obj := range output.Contents {
 		key := aws.ToString(obj.Key)
 		// Skip the directory marker itself (e.g., "dir/" when listing "dir/")
@@ -203,12 +205,43 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 			continue
 		}
 
+		// Extract just the name relative to the prefix
+		// For example, if prefix is "dir/" and key is "dir/file.txt", name should be "file.txt"
+		name := strings.TrimPrefix(key, prefix)
+
+		// Check if this is a direct child or if it's in a subdirectory
+		slashIdx := strings.Index(name, "/")
+
+		var displayName string
+		var isDir bool
+
+		if slashIdx == -1 {
+			// Direct child file (e.g., "file.txt")
+			displayName = name
+			isDir = false
+		} else if slashIdx == len(name)-1 {
+			// Direct child directory marker (e.g., "subdir/")
+			displayName = name[:slashIdx]
+			isDir = true
+		} else {
+			// File in a subdirectory (e.g., "subdir/file.txt")
+			// We want to show "subdir" as a directory
+			displayName = name[:slashIdx]
+			isDir = true
+		}
+
+		// Skip if we've already added this entry
+		if seen[displayName] {
+			continue
+		}
+		seen[displayName] = true
+
 		// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
 		infos = append(infos, &fileInfo{
-			name:    key,
+			name:    displayName,
 			size:    aws.ToInt64(obj.Size),
 			modTime: aws.ToTime(obj.LastModified),
-			isDir:   strings.HasSuffix(key, "/"),
+			isDir:   isDir,
 		})
 
 		if n > 0 && len(infos) >= n {
@@ -216,6 +249,11 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 		}
 	}
 
+	// Return io.EOF when no entries are found and n > 0 (caller expects more entries)
+	// This signals end of directory listing
+	if len(infos) == 0 && n > 0 {
+		return nil, io.EOF
+	}
 	return infos, nil
 }
 
