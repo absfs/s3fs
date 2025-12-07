@@ -143,12 +143,35 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 		}, nil
 	}
 
-	// For read operations, verify the file exists
+	// For read operations, verify the file or directory exists
 	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
 	if err != nil {
+		// If not found, check if it's a directory (with trailing slash)
+		var noSuchKey *types.NoSuchKey
+		if errors.As(err, &noSuchKey) {
+			dirKey := name
+			if !strings.HasSuffix(dirKey, "/") {
+				dirKey += "/"
+			}
+			_, dirErr := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(fs.bucket),
+				Key:    aws.String(dirKey),
+			})
+			if dirErr != nil {
+				// Neither file nor directory marker exists
+				return nil, wrapError("open", name, err)
+			}
+			// Directory marker exists, open it for reading
+			return &File{
+				fs:      fs,
+				name:    name,
+				key:     name,
+				writing: false,
+			}, nil
+		}
 		return nil, wrapError("open", name, err)
 	}
 
@@ -192,19 +215,11 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 }
 
 // Remove removes a file from S3.
+// Note: S3's DeleteObject succeeds even if the object doesn't exist.
 func (fs *FileSystem) Remove(name string) error {
 	name = strings.TrimPrefix(name, "/")
 
-	// Check if the file exists first
-	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(fs.bucket),
-		Key:    aws.String(name),
-	})
-	if err != nil {
-		return wrapError("remove", name, err)
-	}
-
-	_, err = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+	_, err := fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
@@ -240,21 +255,40 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
 	name = strings.TrimPrefix(name, "/")
 
+	// Try the exact path first
 	output, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
-	if err != nil {
-		return nil, wrapError("stat", name, err)
+	if err == nil {
+		// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
+		return &fileInfo{
+			name:    path.Base(name),
+			size:    aws.ToInt64(output.ContentLength),
+			modTime: aws.ToTime(output.LastModified),
+			isDir:   strings.HasSuffix(name, "/"),
+		}, nil
 	}
 
-	// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
-	return &fileInfo{
-		name:    path.Base(name),
-		size:    aws.ToInt64(output.ContentLength),
-		modTime: aws.ToTime(output.LastModified),
-		isDir:   strings.HasSuffix(name, "/"),
-	}, nil
+	// If not found and doesn't have trailing slash, try with trailing slash (directory)
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) && !strings.HasSuffix(name, "/") {
+		dirKey := name + "/"
+		output, dirErr := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(dirKey),
+		})
+		if dirErr == nil {
+			return &fileInfo{
+				name:    path.Base(name),
+				size:    aws.ToInt64(output.ContentLength),
+				modTime: aws.ToTime(output.LastModified),
+				isDir:   true,
+			}, nil
+		}
+	}
+
+	return nil, wrapError("stat", name, err)
 }
 
 // Chmod is not supported for S3.
