@@ -1,6 +1,9 @@
 # S3FS - S3 FileSystem
 
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/absfs/s3fs/blob/master/LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/absfs/s3fs.svg)](https://pkg.go.dev/github.com/absfs/s3fs)
+[![Go Report Card](https://goreportcard.com/badge/github.com/absfs/s3fs)](https://goreportcard.com/report/github.com/absfs/s3fs)
+[![CI](https://github.com/absfs/s3fs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/s3fs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 The `s3fs` package implements an `absfs.Filer` for S3-compatible object storage. It provides file operations on S3 buckets using the AWS SDK v2.
 
