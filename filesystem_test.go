@@ -4,8 +4,6 @@ import (
 	"errors"
 	"os"
 	"testing"
-
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // Helper to create a test filesystem with mock client
@@ -22,7 +20,8 @@ func newTestFS() (*FileSystem, *MockS3Client) {
 // --- OpenFile Tests ---
 
 func TestOpenFile_ReadMode(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
+	mock.PutTestObject("test.txt", []byte("test content"))
 
 	f, err := fs.OpenFile("test.txt", os.O_RDONLY, 0)
 	if err != nil {
@@ -89,7 +88,8 @@ func TestOpenFile_WriteMode_WRONLY(t *testing.T) {
 }
 
 func TestOpenFile_PathSanitization_LeadingSlash(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
+	mock.PutTestObject("path/to/file.txt", []byte("test content"))
 
 	f, err := fs.OpenFile("/path/to/file.txt", os.O_RDONLY, 0)
 	if err != nil {
@@ -352,9 +352,9 @@ func TestRename_SourceNotFound(t *testing.T) {
 		t.Error("Expected error when source doesn't exist")
 	}
 
-	var noSuchKey *types.NoSuchKey
-	if !errors.As(err, &noSuchKey) {
-		t.Errorf("Expected NoSuchKey error, got: %v", err)
+	// wrapError converts NoSuchKey to PathError with os.ErrNotExist
+	if !os.IsNotExist(err) {
+		t.Errorf("Expected os.ErrNotExist error, got: %v", err)
 	}
 }
 
