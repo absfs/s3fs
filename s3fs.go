@@ -3,8 +3,10 @@
 package s3fs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -214,16 +216,33 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 	return wrapError("mkdir", name, err)
 }
 
-// Remove removes a file from S3.
+// Remove removes a file or directory from S3.
+// For directories, it removes the directory marker (key with trailing slash).
 // Note: S3's DeleteObject succeeds even if the object doesn't exist.
 func (fs *FileSystem) Remove(name string) error {
 	name = strings.TrimPrefix(name, "/")
 
+	// First, try to remove as a file
 	_, err := fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
-	return wrapError("remove", name, err)
+	if err != nil {
+		return wrapError("remove", name, err)
+	}
+
+	// Also try to remove as a directory marker (with trailing slash)
+	// This handles the case where we're removing an empty directory
+	if !strings.HasSuffix(name, "/") {
+		dirKey := name + "/"
+		_, _ = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(dirKey),
+		})
+		// Ignore errors for directory marker deletion
+	}
+
+	return nil
 }
 
 // Rename renames (moves) a file in S3 by copying and deleting.
@@ -304,6 +323,46 @@ func (fs *FileSystem) Chtimes(name string, atime time.Time, mtime time.Time) err
 // Chown is not supported for S3.
 func (fs *FileSystem) Chown(name string, uid, gid int) error {
 	return absfs.ErrNotImplemented
+}
+
+// Truncate truncates a file to the specified size.
+// For S3, this requires reading the file, truncating the data, and writing it back.
+func (fs *FileSystem) Truncate(name string, size int64) error {
+	name = strings.TrimPrefix(name, "/")
+
+	// Read the existing file content
+	output, err := fs.client.GetObject(fs.ctx, &s3.GetObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+	if err != nil {
+		return wrapError("truncate", name, err)
+	}
+	defer output.Body.Close()
+
+	// Read the content
+	content, err := io.ReadAll(output.Body)
+	if err != nil {
+		return wrapError("truncate", name, err)
+	}
+
+	// Truncate the content
+	var truncated []byte
+	if size < int64(len(content)) {
+		truncated = content[:size]
+	} else {
+		// Extend with zeros if size is larger
+		truncated = make([]byte, size)
+		copy(truncated, content)
+	}
+
+	// Write back the truncated content
+	_, err = fs.client.PutObject(fs.ctx, &s3.PutObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+		Body:   bytes.NewReader(truncated),
+	})
+	return wrapError("truncate", name, err)
 }
 
 // fileInfo implements os.FileInfo for S3 objects.
