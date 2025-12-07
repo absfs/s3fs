@@ -37,9 +37,9 @@ func TestNewConfig(t *testing.T) {
 
 func TestFileInfo(t *testing.T) {
 	fi := &fileInfo{
-		name:    "test.txt",
-		size:    1024,
-		isDir:   false,
+		name:  "test.txt",
+		size:  1024,
+		isDir: false,
 	}
 
 	if fi.Name() != "test.txt" {

@@ -418,10 +418,10 @@ func TestMockClient_CallTracking(t *testing.T) {
 	mock.PutTestObject("test.txt", []byte("data"))
 
 	// Perform various operations
-	fs.Stat("test.txt")                          // HeadObject call 1
-	fs.Stat("other.txt")                         // HeadObject call 2 (will fail), call 3 (checks for directory)
+	fs.Stat("test.txt")                             // HeadObject call 1
+	fs.Stat("other.txt")                            // HeadObject call 2 (will fail), call 3 (checks for directory)
 	f, _ := fs.OpenFile("test.txt", os.O_RDONLY, 0) // HeadObject call 4 (verifies file exists)
-	f.Read(make([]byte, 10))                    // GetObject call 1
+	f.Read(make([]byte, 10))                        // GetObject call 1
 
 	// Stat now checks for directories when file not found, so we have 4 HeadObject calls
 	if len(mock.HeadObjectCalls) != 4 {
