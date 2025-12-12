@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	iosfs "io/fs"
 	"os"
 	"strings"
 
@@ -269,4 +270,92 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 		names[i] = info.Name()
 	}
 	return names, nil
+}
+
+// ReadDir reads the contents of the directory and returns a slice of up to n DirEntry values.
+func (f *File) ReadDir(n int) ([]iosfs.DirEntry, error) {
+	// Check if this is a directory
+	if !f.writing && f.body == nil {
+		output, err := f.fs.client.HeadObject(f.fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.key),
+		})
+		if err == nil {
+			// Object exists and is a file (not ending in /)
+			if !strings.HasSuffix(f.key, "/") {
+				return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
+			}
+		}
+		_ = output
+	}
+
+	prefix := f.key
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	output, err := f.fs.client.ListObjectsV2(f.fs.ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(f.fs.bucket),
+		Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		return nil, wrapError("readdir", f.name, err)
+	}
+
+	var entries []iosfs.DirEntry
+	seen := make(map[string]bool)
+
+	for _, obj := range output.Contents {
+		key := aws.ToString(obj.Key)
+		// Skip the directory marker itself
+		if key == prefix {
+			continue
+		}
+
+		// Extract relative name
+		name := strings.TrimPrefix(key, prefix)
+
+		// Check if this is a direct child
+		slashIdx := strings.Index(name, "/")
+
+		var displayName string
+		var isDir bool
+
+		if slashIdx == -1 {
+			// Direct child file
+			displayName = name
+			isDir = false
+		} else if slashIdx == len(name)-1 {
+			// Direct child directory marker
+			displayName = name[:slashIdx]
+			isDir = true
+		} else {
+			// File in subdirectory - show subdirectory
+			displayName = name[:slashIdx]
+			isDir = true
+		}
+
+		// Skip duplicates
+		if seen[displayName] {
+			continue
+		}
+		seen[displayName] = true
+
+		entries = append(entries, &fileInfo{
+			name:    displayName,
+			size:    aws.ToInt64(obj.Size),
+			modTime: aws.ToTime(obj.LastModified),
+			isDir:   isDir,
+		})
+
+		if n > 0 && len(entries) >= n {
+			break
+		}
+	}
+
+	// Return io.EOF when no entries are found and n > 0
+	if len(entries) == 0 && n > 0 {
+		return nil, io.EOF
+	}
+	return entries, nil
 }

@@ -1,18 +1,18 @@
 module github.com/absfs/s3fs
 
-go 1.21
+go 1.23
 
 require (
-	github.com/absfs/absfs v0.0.0-20251109181304-77e2f9ac4448
+	github.com/absfs/absfs v0.0.0-20251208232938-aa0ca30de832
+	github.com/absfs/fstesting v0.0.0-20251206231118-7a50ca2cce8a
 	github.com/aws/aws-sdk-go-v2 v1.24.0
 	github.com/aws/aws-sdk-go-v2/config v1.26.1
+	github.com/aws/aws-sdk-go-v2/credentials v1.16.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.47.5
 )
 
 require (
-	github.com/absfs/fstesting v0.0.0-20251206231118-7a50ca2cce8a // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.5.4 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.16.12 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.14.10 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.2.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.5.9 // indirect
@@ -27,3 +27,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.26.5 // indirect
 	github.com/aws/smithy-go v1.19.0 // indirect
 )
+
+replace github.com/absfs/absfs => ../absfs
+
+replace github.com/absfs/fstesting => ../fstesting

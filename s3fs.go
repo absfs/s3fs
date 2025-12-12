@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	iosfs "io/fs"
 	"os"
 	"path"
 	"strings"
@@ -379,3 +380,168 @@ func (fi *fileInfo) Mode() os.FileMode  { return 0644 }
 func (fi *fileInfo) ModTime() time.Time { return fi.modTime }
 func (fi *fileInfo) IsDir() bool        { return fi.isDir }
 func (fi *fileInfo) Sys() interface{}   { return nil }
+
+// Type implements iosfs.DirEntry.
+func (fi *fileInfo) Type() iosfs.FileMode {
+	if fi.isDir {
+		return iosfs.ModeDir
+	}
+	return 0
+}
+
+// Info implements iosfs.DirEntry.
+func (fi *fileInfo) Info() (iosfs.FileInfo, error) {
+	return fi, nil
+}
+
+// ReadDir reads the named directory and returns a list of directory entries sorted by filename.
+func (fs *FileSystem) ReadDir(name string) ([]iosfs.DirEntry, error) {
+	name = strings.TrimPrefix(name, "/")
+
+	// For root or empty, list with empty prefix
+	prefix := name
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	output, err := fs.client.ListObjectsV2(fs.ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(fs.bucket),
+		Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		return nil, wrapError("readdir", name, err)
+	}
+
+	var entries []iosfs.DirEntry
+	seen := make(map[string]bool)
+
+	for _, obj := range output.Contents {
+		key := aws.ToString(obj.Key)
+		// Skip the directory marker itself
+		if key == prefix {
+			continue
+		}
+
+		// Extract relative name
+		relName := strings.TrimPrefix(key, prefix)
+
+		// Check if this is a direct child
+		slashIdx := strings.Index(relName, "/")
+
+		var displayName string
+		var isDir bool
+
+		if slashIdx == -1 {
+			// Direct child file
+			displayName = relName
+			isDir = false
+		} else if slashIdx == len(relName)-1 {
+			// Direct child directory marker
+			displayName = relName[:slashIdx]
+			isDir = true
+		} else {
+			// File in subdirectory - show subdirectory
+			displayName = relName[:slashIdx]
+			isDir = true
+		}
+
+		// Skip duplicates
+		if seen[displayName] {
+			continue
+		}
+		seen[displayName] = true
+
+		entries = append(entries, &fileInfo{
+			name:    displayName,
+			size:    aws.ToInt64(obj.Size),
+			modTime: aws.ToTime(obj.LastModified),
+			isDir:   isDir,
+		})
+	}
+
+	return entries, nil
+}
+
+// ReadFile reads the named file and returns its contents.
+func (fs *FileSystem) ReadFile(name string) ([]byte, error) {
+	name = strings.TrimPrefix(name, "/")
+
+	output, err := fs.client.GetObject(fs.ctx, &s3.GetObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+	if err != nil {
+		return nil, wrapError("readfile", name, err)
+	}
+	defer output.Body.Close()
+
+	return io.ReadAll(output.Body)
+}
+
+// Sub returns an fs.FS corresponding to the subtree rooted at dir.
+func (fs *FileSystem) Sub(dir string) (iosfs.FS, error) {
+	dir = strings.TrimPrefix(dir, "/")
+	return absfs.FilerToFS(fs, dir)
+}
+
+// subFS wraps a FileSystem to operate within a subdirectory.
+type subFS struct {
+	parent *FileSystem
+	prefix string
+}
+
+func (s *subFS) fullPath(name string) string {
+	name = strings.TrimPrefix(name, "/")
+	if s.prefix == "" {
+		return name
+	}
+	if name == "" {
+		return s.prefix
+	}
+	return path.Join(s.prefix, name)
+}
+
+func (s *subFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
+	return s.parent.OpenFile(s.fullPath(name), flag, perm)
+}
+
+func (s *subFS) Mkdir(name string, perm os.FileMode) error {
+	return s.parent.Mkdir(s.fullPath(name), perm)
+}
+
+func (s *subFS) Remove(name string) error {
+	return s.parent.Remove(s.fullPath(name))
+}
+
+func (s *subFS) Rename(oldpath, newpath string) error {
+	return s.parent.Rename(s.fullPath(oldpath), s.fullPath(newpath))
+}
+
+func (s *subFS) Stat(name string) (os.FileInfo, error) {
+	return s.parent.Stat(s.fullPath(name))
+}
+
+func (s *subFS) Chmod(name string, mode os.FileMode) error {
+	return s.parent.Chmod(s.fullPath(name), mode)
+}
+
+func (s *subFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	return s.parent.Chtimes(s.fullPath(name), atime, mtime)
+}
+
+func (s *subFS) Chown(name string, uid, gid int) error {
+	return s.parent.Chown(s.fullPath(name), uid, gid)
+}
+
+func (s *subFS) ReadDir(name string) ([]iosfs.DirEntry, error) {
+	return s.parent.ReadDir(s.fullPath(name))
+}
+
+func (s *subFS) ReadFile(name string) ([]byte, error) {
+	return s.parent.ReadFile(s.fullPath(name))
+}
+
+func (s *subFS) Sub(dir string) (iosfs.FS, error) {
+	fullDir := s.fullPath(dir)
+	return absfs.FilerToFS(s, fullDir)
+}
