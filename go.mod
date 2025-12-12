@@ -1,10 +1,10 @@
 module github.com/absfs/s3fs
 
-go 1.23
+go 1.21
 
 require (
-	github.com/absfs/absfs v0.9.1
-	github.com/absfs/fstesting v0.9.1
+	github.com/absfs/absfs v1.0.0
+	github.com/absfs/fstesting v1.0.0
 	github.com/aws/aws-sdk-go-v2 v1.24.0
 	github.com/aws/aws-sdk-go-v2/config v1.26.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.16.12
