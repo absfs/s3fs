@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,10 @@ type MockS3Client struct {
 
 	// Per-key error injection for DeleteObject (checked before global DeleteObjectErr)
 	DeleteObjectKeyErrs map[string]error
+
+	// DefaultMaxKeys overrides the default 1000 max keys for ListObjectsV2.
+	// Set to a small value in tests to force pagination behavior.
+	DefaultMaxKeys int32
 
 	// Call tracking for assertions
 	GetObjectCalls    []string
@@ -282,7 +287,7 @@ func (m *MockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 	}, nil
 }
 
-// ListObjectsV2 implements S3Client.
+// ListObjectsV2 implements S3Client with pagination support via ContinuationToken.
 func (m *MockS3Client) ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	m.mu.Lock()
 	prefix := aws.ToString(params.Prefix)
@@ -296,33 +301,62 @@ func (m *MockS3Client) ListObjectsV2(ctx context.Context, params *s3.ListObjects
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var contents []types.Object
-	for key, obj := range m.objects {
+	// Collect and sort matching keys for deterministic pagination
+	var keys []string
+	for key := range m.objects {
 		if strings.HasPrefix(key, prefix) {
-			contents = append(contents, types.Object{
-				Key:          aws.String(key),
-				Size:         aws.Int64(int64(len(obj.data))),
-				LastModified: aws.Time(obj.lastModified),
-			})
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	// Handle ContinuationToken (the token is the last key from previous page)
+	startIdx := 0
+	if params.ContinuationToken != nil {
+		token := aws.ToString(params.ContinuationToken)
+		for i, key := range keys {
+			if key > token {
+				startIdx = i
+				break
+			}
+			// If we reach the end without finding a key > token, no results
+			if i == len(keys)-1 {
+				startIdx = len(keys)
+			}
 		}
 	}
 
-	// Handle MaxKeys
-	maxKeys := int32(1000) // Default
+	maxKeys := int32(1000)
+	if m.DefaultMaxKeys > 0 {
+		maxKeys = m.DefaultMaxKeys
+	}
 	if params.MaxKeys != nil {
 		maxKeys = *params.MaxKeys
 	}
 
-	isTruncated := false
-	if int32(len(contents)) > maxKeys {
-		contents = contents[:maxKeys]
-		isTruncated = true
+	var contents []types.Object
+	endIdx := startIdx
+	for i := startIdx; i < len(keys) && int32(len(contents)) < maxKeys; i++ {
+		obj := m.objects[keys[i]]
+		contents = append(contents, types.Object{
+			Key:          aws.String(keys[i]),
+			Size:         aws.Int64(int64(len(obj.data))),
+			LastModified: aws.Time(obj.lastModified),
+		})
+		endIdx = i
+	}
+
+	isTruncated := endIdx < len(keys)-1 && len(contents) > 0
+	var nextToken *string
+	if isTruncated {
+		nextToken = aws.String(keys[endIdx])
 	}
 
 	return &s3.ListObjectsV2Output{
-		Contents:    contents,
-		IsTruncated: aws.Bool(isTruncated),
-		KeyCount:    aws.Int32(int32(len(contents))),
+		Contents:              contents,
+		IsTruncated:           aws.Bool(isTruncated),
+		KeyCount:              aws.Int32(int32(len(contents))),
+		NextContinuationToken: nextToken,
 	}, nil
 }
 

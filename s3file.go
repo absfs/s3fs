@@ -34,6 +34,7 @@ func (f *File) Name() string {
 }
 
 // Read reads from the S3 object.
+// On first call, the object is fetched from S3 and cached for subsequent reads.
 func (f *File) Read(b []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,7 +58,8 @@ func (f *File) Read(b []byte) (int, error) {
 	return f.body.Read(b)
 }
 
-// ReadAt reads from the S3 object at a specific offset.
+// ReadAt reads from the S3 object at a specific offset using S3 range reads.
+// Each call issues a new GetObject request with the appropriate byte range.
 func (f *File) ReadAt(b []byte, off int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -66,7 +68,6 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 		return 0, os.ErrInvalid
 	}
 
-	// S3 supports range reads - Issue #11 fix: use proper integer formatting
 	rangeStr := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(b))-1)
 	output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.fs.bucket),
@@ -81,7 +82,9 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 	return io.ReadFull(output.Body, b)
 }
 
-// Write writes to the file buffer (will be uploaded on Close).
+// Write writes to the file buffer. The buffer is uploaded to S3 on Close.
+// In append mode, writes always go to the end of the buffer regardless of
+// the current offset.
 func (f *File) Write(b []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -117,10 +120,12 @@ func (f *File) WriteAt(b []byte, off int64) (int, error) {
 
 // WriteString writes a string to the file.
 func (f *File) WriteString(s string) (int, error) {
+	// Write handles its own locking
 	return f.Write([]byte(s))
 }
 
-// Close closes the file and uploads to S3 if writing.
+// Close closes the file. For files opened for writing, the buffered content
+// is uploaded to S3.
 func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,7 +135,6 @@ func (f *File) Close() error {
 	}
 
 	if f.writing {
-		// Upload the buffer to S3
 		_, err := f.fs.client.PutObject(f.fs.ctx, &s3.PutObjectInput{
 			Bucket: aws.String(f.fs.bucket),
 			Key:    aws.String(f.key),
@@ -142,7 +146,8 @@ func (f *File) Close() error {
 	return nil
 }
 
-// Seek seeks within the file.
+// Seek sets the offset for the next read or write.
+// SeekEnd is not supported for S3 files.
 func (f *File) Seek(offset int64, whence int) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -153,7 +158,6 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		f.offset += offset
 	case io.SeekEnd:
-		// Would need to know file size
 		return 0, os.ErrInvalid
 	}
 	return f.offset, nil
@@ -169,7 +173,7 @@ func (f *File) Sync() error {
 	return nil
 }
 
-// Truncate truncates the file.
+// Truncate changes the size of the file buffer. It does not change the I/O offset.
 func (f *File) Truncate(size int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -188,24 +192,20 @@ func (f *File) Truncate(size int64) error {
 	return nil
 }
 
-// Readdir reads directory entries (lists objects with prefix).
+// Readdir reads directory entries (lists objects with the file's key as prefix).
+// If n > 0, Readdir returns at most n entries. If n <= 0, it returns all entries.
 func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if !f.writing && f.body == nil {
-		// Check if the key exists and is a file (not a directory)
 		output, err := f.fs.client.HeadObject(f.fs.ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(f.fs.bucket),
 			Key:    aws.String(f.key),
 		})
-		if err == nil {
-			// Object exists and is a file (not ending in /)
-			if !strings.HasSuffix(f.key, "/") {
-				return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
-			}
+		if err == nil && !strings.HasSuffix(f.key, "/") {
+			return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
 		}
-		// If object doesn't exist, that's ok - we'll try listing with prefix
 		_ = output
 	}
 
@@ -214,70 +214,69 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 		prefix += "/"
 	}
 
-	output, err := f.fs.client.ListObjectsV2(f.fs.ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.fs.bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, wrapError("readdir", f.name, err)
-	}
-
 	var infos []os.FileInfo
-	seen := make(map[string]bool) // Track entries we've already added
+	seen := make(map[string]bool)
 
-	for _, obj := range output.Contents {
-		key := aws.ToString(obj.Key)
-		// Skip the directory marker itself (e.g., "dir/" when listing "dir/")
-		if key == prefix {
-			continue
-		}
-
-		// Extract just the name relative to the prefix
-		// For example, if prefix is "dir/" and key is "dir/file.txt", name should be "file.txt"
-		name := strings.TrimPrefix(key, prefix)
-
-		// Check if this is a direct child or if it's in a subdirectory
-		slashIdx := strings.Index(name, "/")
-
-		var displayName string
-		var isDir bool
-
-		if slashIdx == -1 {
-			// Direct child file (e.g., "file.txt")
-			displayName = name
-			isDir = false
-		} else if slashIdx == len(name)-1 {
-			// Direct child directory marker (e.g., "subdir/")
-			displayName = name[:slashIdx]
-			isDir = true
-		} else {
-			// File in a subdirectory (e.g., "subdir/file.txt")
-			// We want to show "subdir" as a directory
-			displayName = name[:slashIdx]
-			isDir = true
-		}
-
-		// Skip if we've already added this entry
-		if seen[displayName] {
-			continue
-		}
-		seen[displayName] = true
-
-		// Issue #12 fix: use safe nil-pointer handling with aws.ToInt64/aws.ToTime
-		infos = append(infos, &fileInfo{
-			name:    displayName,
-			size:    aws.ToInt64(obj.Size),
-			modTime: aws.ToTime(obj.LastModified),
-			isDir:   isDir,
+	var continuationToken *string
+	for {
+		output, err := f.fs.client.ListObjectsV2(f.fs.ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(f.fs.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
 		})
+		if err != nil {
+			return nil, wrapError("readdir", f.name, err)
+		}
 
-		if n > 0 && len(infos) >= n {
+		for _, obj := range output.Contents {
+			key := aws.ToString(obj.Key)
+			if key == prefix {
+				continue
+			}
+
+			name := strings.TrimPrefix(key, prefix)
+			slashIdx := strings.Index(name, "/")
+
+			var displayName string
+			var isDir bool
+
+			if slashIdx == -1 {
+				displayName = name
+				isDir = false
+			} else if slashIdx == len(name)-1 {
+				displayName = name[:slashIdx]
+				isDir = true
+			} else {
+				displayName = name[:slashIdx]
+				isDir = true
+			}
+
+			if seen[displayName] {
+				continue
+			}
+			seen[displayName] = true
+
+			infos = append(infos, &fileInfo{
+				name:    displayName,
+				size:    aws.ToInt64(obj.Size),
+				modTime: aws.ToTime(obj.LastModified),
+				isDir:   isDir,
+			})
+
+			if n > 0 && len(infos) >= n {
+				if len(infos) == 0 && n > 0 {
+					return nil, io.EOF
+				}
+				return infos, nil
+			}
+		}
+
+		if !aws.ToBool(output.IsTruncated) {
 			break
 		}
+		continuationToken = output.NextContinuationToken
 	}
 
-	// Return io.EOF when no entries are found and n > 0 (caller expects more entries)
-	// This signals end of directory listing
 	if len(infos) == 0 && n > 0 {
 		return nil, io.EOF
 	}
@@ -299,6 +298,7 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 }
 
 // ReadDir reads the contents of the directory and returns a slice of up to n DirEntry values.
+// If n > 0, ReadDir returns at most n entries. If n <= 0, it returns all entries.
 func (f *File) ReadDir(n int) ([]iosfs.DirEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -308,11 +308,8 @@ func (f *File) ReadDir(n int) ([]iosfs.DirEntry, error) {
 			Bucket: aws.String(f.fs.bucket),
 			Key:    aws.String(f.key),
 		})
-		if err == nil {
-			// Object exists and is a file (not ending in /)
-			if !strings.HasSuffix(f.key, "/") {
-				return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
-			}
+		if err == nil && !strings.HasSuffix(f.key, "/") {
+			return nil, &os.PathError{Op: "readdir", Path: f.name, Err: os.ErrInvalid}
 		}
 		_ = output
 	}
@@ -322,66 +319,69 @@ func (f *File) ReadDir(n int) ([]iosfs.DirEntry, error) {
 		prefix += "/"
 	}
 
-	output, err := f.fs.client.ListObjectsV2(f.fs.ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.fs.bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, wrapError("readdir", f.name, err)
-	}
-
 	var entries []iosfs.DirEntry
 	seen := make(map[string]bool)
 
-	for _, obj := range output.Contents {
-		key := aws.ToString(obj.Key)
-		// Skip the directory marker itself
-		if key == prefix {
-			continue
-		}
-
-		// Extract relative name
-		name := strings.TrimPrefix(key, prefix)
-
-		// Check if this is a direct child
-		slashIdx := strings.Index(name, "/")
-
-		var displayName string
-		var isDir bool
-
-		if slashIdx == -1 {
-			// Direct child file
-			displayName = name
-			isDir = false
-		} else if slashIdx == len(name)-1 {
-			// Direct child directory marker
-			displayName = name[:slashIdx]
-			isDir = true
-		} else {
-			// File in subdirectory - show subdirectory
-			displayName = name[:slashIdx]
-			isDir = true
-		}
-
-		// Skip duplicates
-		if seen[displayName] {
-			continue
-		}
-		seen[displayName] = true
-
-		entries = append(entries, &fileInfo{
-			name:    displayName,
-			size:    aws.ToInt64(obj.Size),
-			modTime: aws.ToTime(obj.LastModified),
-			isDir:   isDir,
+	var continuationToken *string
+	for {
+		output, err := f.fs.client.ListObjectsV2(f.fs.ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(f.fs.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
 		})
+		if err != nil {
+			return nil, wrapError("readdir", f.name, err)
+		}
 
-		if n > 0 && len(entries) >= n {
+		for _, obj := range output.Contents {
+			key := aws.ToString(obj.Key)
+			if key == prefix {
+				continue
+			}
+
+			name := strings.TrimPrefix(key, prefix)
+			slashIdx := strings.Index(name, "/")
+
+			var displayName string
+			var isDir bool
+
+			if slashIdx == -1 {
+				displayName = name
+				isDir = false
+			} else if slashIdx == len(name)-1 {
+				displayName = name[:slashIdx]
+				isDir = true
+			} else {
+				displayName = name[:slashIdx]
+				isDir = true
+			}
+
+			if seen[displayName] {
+				continue
+			}
+			seen[displayName] = true
+
+			entries = append(entries, &fileInfo{
+				name:    displayName,
+				size:    aws.ToInt64(obj.Size),
+				modTime: aws.ToTime(obj.LastModified),
+				isDir:   isDir,
+			})
+
+			if n > 0 && len(entries) >= n {
+				if len(entries) == 0 && n > 0 {
+					return nil, io.EOF
+				}
+				return entries, nil
+			}
+		}
+
+		if !aws.ToBool(output.IsTruncated) {
 			break
 		}
+		continuationToken = output.NextContinuationToken
 	}
 
-	// Return io.EOF when no entries are found and n > 0
 	if len(entries) == 0 && n > 0 {
 		return nil, io.EOF
 	}

@@ -708,3 +708,78 @@ func TestRename_DeleteError_RollsBack(t *testing.T) {
 		t.Error("Rollback should have deleted dst.txt")
 	}
 }
+
+// --- Readdir Pagination Tests (Issue #2) ---
+
+func TestReaddir_Pagination(t *testing.T) {
+	mock := NewMockS3Client()
+	mock.DefaultMaxKeys = 2
+	fs := NewWithClient(mock, "test-bucket")
+
+	mock.PutTestObject("bigdir/", []byte(""))
+	for i := 0; i < 5; i++ {
+		key := "bigdir/" + string(rune('a'+i)) + ".txt"
+		mock.PutTestObject(key, []byte("data"))
+	}
+
+	f, err := fs.OpenFile("bigdir/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	infos, err := f.Readdir(-1)
+	if err != nil {
+		t.Fatalf("Readdir failed: %v", err)
+	}
+
+	if len(infos) != 5 {
+		t.Errorf("Readdir returned %d entries, want 5 (across multiple pages)", len(infos))
+	}
+}
+
+func TestReadDir_Pagination_FileSystem(t *testing.T) {
+	mock := NewMockS3Client()
+	mock.DefaultMaxKeys = 2
+	fs := NewWithClient(mock, "test-bucket")
+
+	mock.PutTestObject("pagdir/", []byte(""))
+	for i := 0; i < 5; i++ {
+		key := "pagdir/" + string(rune('a'+i)) + ".txt"
+		mock.PutTestObject(key, []byte("data"))
+	}
+
+	entries, err := fs.ReadDir("pagdir")
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	if len(entries) != 5 {
+		t.Errorf("ReadDir returned %d entries, want 5 (across multiple pages)", len(entries))
+	}
+}
+
+func TestReadDir_Pagination_File(t *testing.T) {
+	mock := NewMockS3Client()
+	mock.DefaultMaxKeys = 2
+	fs := NewWithClient(mock, "test-bucket")
+
+	mock.PutTestObject("pagdir2/", []byte(""))
+	for i := 0; i < 5; i++ {
+		key := "pagdir2/" + string(rune('a'+i)) + ".txt"
+		mock.PutTestObject(key, []byte("data"))
+	}
+
+	f, err := fs.OpenFile("pagdir2/", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	entries, err := f.(*File).ReadDir(-1)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	if len(entries) != 5 {
+		t.Errorf("File.ReadDir returned %d entries, want 5 (across multiple pages)", len(entries))
+	}
+}

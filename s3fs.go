@@ -1,5 +1,13 @@
-// Package s3fs implements an absfs.Filer for S3-compatible object storage.
-// It provides file operations on S3 buckets using the AWS SDK v2.
+// Package s3fs implements an [absfs.Filer] backed by S3-compatible object storage.
+//
+// Directories are represented as zero-byte objects with a trailing slash.
+// Write operations are buffered in memory and uploaded to S3 on [File.Close].
+// The FileSystem is safe for concurrent use; individual [File] instances are
+// also safe for concurrent use as of v1.1.
+//
+// S3 does not support POSIX permissions, ownership, or timestamps, so
+// [FileSystem.Chmod], [FileSystem.Chtimes], and [FileSystem.Chown] return
+// [absfs.ErrNotImplemented].
 package s3fs
 
 import (
@@ -83,9 +91,17 @@ func NewWithClientAndContext(ctx context.Context, client S3Client, bucket string
 // It normalizes "." and ".." components and rejects paths that would
 // escape above the root (e.g., "../secret").
 func sanitizePath(p string) (string, error) {
+	// Normalize: add leading slash so path.Clean handles ".." correctly
 	clean := path.Clean("/" + p)
+	// Remove the leading slash we added
 	clean = strings.TrimPrefix(clean, "/")
 
+	// path.Clean("/" + "../x") yields "/x" which is fine,
+	// but path.Clean("/" + "../../x") also yields "/x".
+	// The real danger is "..": path.Clean("/..") → "/"
+	// We detect traversal by checking if the cleaned path would have
+	// gone above root. After cleaning with a leading slash, if the result
+	// is "/" or starts with "..", it's traversal.
 	if clean == "." {
 		clean = ""
 	}
@@ -94,6 +110,16 @@ func sanitizePath(p string) (string, error) {
 	}
 
 	return clean, nil
+}
+
+// WithContext returns a copy of the FileSystem that uses the given context
+// for all S3 operations.
+func (fs *FileSystem) WithContext(ctx context.Context) *FileSystem {
+	return &FileSystem{
+		client: fs.client,
+		bucket: fs.bucket,
+		ctx:    ctx,
+	}
 }
 
 // wrapError wraps S3 errors to be compatible with os.IsNotExist and os.IsExist.
@@ -112,8 +138,12 @@ func wrapError(op, path string, err error) error {
 	return &os.PathError{Op: op, Path: path, Err: err}
 }
 
-// OpenFile opens a file in S3.
-// Note: S3 doesn't support traditional file flags, so this is a simplified implementation.
+// OpenFile opens the named file in S3.
+//
+// Supported flags: O_RDONLY, O_WRONLY, O_RDWR, O_CREATE, O_EXCL, O_TRUNC, O_APPEND.
+// When O_APPEND is set, existing content is loaded and new writes append to it.
+// When O_TRUNC is set (or O_CREATE for a new file), the file starts empty.
+// Paths are sanitized to prevent traversal attacks.
 func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
 	var err error
 	name, err = sanitizePath(name)
@@ -142,7 +172,6 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 	// For write operations
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
 		// Check if trying to write to a directory
-		// Directories in S3 are marked with trailing slash
 		dirKey := name
 		if !strings.HasSuffix(dirKey, "/") {
 			dirKey += "/"
@@ -169,6 +198,7 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 				buf, _ = io.ReadAll(getOutput.Body)
 				getOutput.Body.Close()
 			}
+			// If file doesn't exist, start with empty buffer
 		}
 
 		if buf == nil {
@@ -231,7 +261,8 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 	}, nil
 }
 
-// Mkdir creates a "directory" in S3 (creates a zero-byte object with trailing slash).
+// Mkdir creates a directory in S3 by writing a zero-byte object with a trailing slash.
+// Returns os.ErrExist if the directory already exists.
 func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 	var err error
 	name, err = sanitizePath(name)
@@ -267,8 +298,8 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 }
 
 // Remove removes a file or directory from S3.
+// Returns os.ErrNotExist if neither the file nor a directory marker exists.
 // For directories, it removes the directory marker (key with trailing slash).
-// Note: S3's DeleteObject succeeds even if the object doesn't exist.
 func (fs *FileSystem) Remove(name string) error {
 	var err error
 	name, err = sanitizePath(name)
@@ -294,6 +325,7 @@ func (fs *FileSystem) Remove(name string) error {
 			Key:    aws.String(dirKey),
 		})
 		if dirErr != nil {
+			// Neither file nor directory exists
 			return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
 		}
 		isDirMarker = true
@@ -327,7 +359,9 @@ func (fs *FileSystem) Remove(name string) error {
 	return nil
 }
 
-// Rename renames (moves) a file in S3 by copying and deleting.
+// Rename moves a file in S3 by copying to the new key and deleting the old one.
+// This is not atomic. If the delete fails after a successful copy, the copy is
+// rolled back (best-effort).
 func (fs *FileSystem) Rename(oldpath, newpath string) error {
 	var err error
 	oldpath, err = sanitizePath(oldpath)
@@ -513,59 +547,60 @@ func (fs *FileSystem) ReadDir(name string) ([]iosfs.DirEntry, error) {
 		prefix += "/"
 	}
 
-	output, err := fs.client.ListObjectsV2(fs.ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(fs.bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, wrapError("readdir", name, err)
-	}
-
 	var entries []iosfs.DirEntry
 	seen := make(map[string]bool)
 
-	for _, obj := range output.Contents {
-		key := aws.ToString(obj.Key)
-		// Skip the directory marker itself
-		if key == prefix {
-			continue
-		}
-
-		// Extract relative name
-		relName := strings.TrimPrefix(key, prefix)
-
-		// Check if this is a direct child
-		slashIdx := strings.Index(relName, "/")
-
-		var displayName string
-		var isDir bool
-
-		if slashIdx == -1 {
-			// Direct child file
-			displayName = relName
-			isDir = false
-		} else if slashIdx == len(relName)-1 {
-			// Direct child directory marker
-			displayName = relName[:slashIdx]
-			isDir = true
-		} else {
-			// File in subdirectory - show subdirectory
-			displayName = relName[:slashIdx]
-			isDir = true
-		}
-
-		// Skip duplicates
-		if seen[displayName] {
-			continue
-		}
-		seen[displayName] = true
-
-		entries = append(entries, &fileInfo{
-			name:    displayName,
-			size:    aws.ToInt64(obj.Size),
-			modTime: aws.ToTime(obj.LastModified),
-			isDir:   isDir,
+	var continuationToken *string
+	for {
+		output, err := fs.client.ListObjectsV2(fs.ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(fs.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
 		})
+		if err != nil {
+			return nil, wrapError("readdir", name, err)
+		}
+
+		for _, obj := range output.Contents {
+			key := aws.ToString(obj.Key)
+			if key == prefix {
+				continue
+			}
+
+			relName := strings.TrimPrefix(key, prefix)
+			slashIdx := strings.Index(relName, "/")
+
+			var displayName string
+			var isDir bool
+
+			if slashIdx == -1 {
+				displayName = relName
+				isDir = false
+			} else if slashIdx == len(relName)-1 {
+				displayName = relName[:slashIdx]
+				isDir = true
+			} else {
+				displayName = relName[:slashIdx]
+				isDir = true
+			}
+
+			if seen[displayName] {
+				continue
+			}
+			seen[displayName] = true
+
+			entries = append(entries, &fileInfo{
+				name:    displayName,
+				size:    aws.ToInt64(obj.Size),
+				modTime: aws.ToTime(obj.LastModified),
+				isDir:   isDir,
+			})
+		}
+
+		if !aws.ToBool(output.IsTruncated) {
+			break
+		}
+		continuationToken = output.NextContinuationToken
 	}
 
 	return entries, nil
