@@ -564,3 +564,32 @@ func TestFileInfo_LargeSize(t *testing.T) {
 		t.Errorf("Size = %d, want 5GB", fi.Size())
 	}
 }
+
+func TestConcurrency_SameFileWrite(t *testing.T) {
+	fs, mock := newTestFS()
+
+	f, err := fs.OpenFile("shared.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.Write([]byte("x"))
+		}()
+	}
+
+	wg.Wait()
+	f.Close()
+
+	data, ok := mock.GetTestObject("shared.txt")
+	if !ok {
+		t.Fatal("File should exist")
+	}
+	if len(data) != 100 {
+		t.Errorf("Expected 100 bytes written, got %d", len(data))
+	}
+}

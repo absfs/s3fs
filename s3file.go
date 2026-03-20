@@ -7,13 +7,17 @@ import (
 	iosfs "io/fs"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // File represents a file in S3.
+// File instances are safe for concurrent use; all mutable state is
+// protected by an internal mutex.
 type File struct {
+	mu      sync.Mutex
 	fs      *FileSystem
 	name    string
 	key     string
@@ -30,6 +34,9 @@ func (f *File) Name() string {
 
 // Read reads from the S3 object.
 func (f *File) Read(b []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.writing {
 		return 0, os.ErrInvalid
 	}
@@ -51,6 +58,9 @@ func (f *File) Read(b []byte) (int, error) {
 
 // ReadAt reads from the S3 object at a specific offset.
 func (f *File) ReadAt(b []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.writing {
 		return 0, os.ErrInvalid
 	}
@@ -72,6 +82,9 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 
 // Write writes to the file buffer (will be uploaded on Close).
 func (f *File) Write(b []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.writing {
 		return 0, os.ErrInvalid
 	}
@@ -83,6 +96,9 @@ func (f *File) Write(b []byte) (int, error) {
 
 // WriteAt writes to the buffer at a specific offset.
 func (f *File) WriteAt(b []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.writing {
 		return 0, os.ErrInvalid
 	}
@@ -105,6 +121,9 @@ func (f *File) WriteString(s string) (int, error) {
 
 // Close closes the file and uploads to S3 if writing.
 func (f *File) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.body != nil {
 		f.body.Close()
 	}
@@ -124,7 +143,9 @@ func (f *File) Close() error {
 
 // Seek seeks within the file.
 func (f *File) Seek(offset int64, whence int) (int64, error) {
-	// For S3, seeking is limited. This is a simplified implementation.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	switch whence {
 	case io.SeekStart:
 		f.offset = offset
@@ -149,6 +170,9 @@ func (f *File) Sync() error {
 
 // Truncate truncates the file.
 func (f *File) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.writing {
 		return os.ErrInvalid
 	}
@@ -165,8 +189,9 @@ func (f *File) Truncate(size int64) error {
 
 // Readdir reads directory entries (lists objects with prefix).
 func (f *File) Readdir(n int) ([]os.FileInfo, error) {
-	// Check if this is a directory (or could be one)
-	// For read operations on files opened for reading, check if it's actually a directory marker
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.writing && f.body == nil {
 		// Check if the key exists and is a file (not a directory)
 		output, err := f.fs.client.HeadObject(f.fs.ctx, &s3.HeadObjectInput{
@@ -274,7 +299,9 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 
 // ReadDir reads the contents of the directory and returns a slice of up to n DirEntry values.
 func (f *File) ReadDir(n int) ([]iosfs.DirEntry, error) {
-	// Check if this is a directory
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if !f.writing && f.body == nil {
 		output, err := f.fs.client.HeadObject(f.fs.ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(f.fs.bucket),
