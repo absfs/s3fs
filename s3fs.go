@@ -79,6 +79,23 @@ func NewWithClientAndContext(ctx context.Context, client S3Client, bucket string
 	}
 }
 
+// sanitizePath cleans and validates a path for S3 operations.
+// It normalizes "." and ".." components and rejects paths that would
+// escape above the root (e.g., "../secret").
+func sanitizePath(p string) (string, error) {
+	clean := path.Clean("/" + p)
+	clean = strings.TrimPrefix(clean, "/")
+
+	if clean == "." {
+		clean = ""
+	}
+	if strings.HasPrefix(clean, "..") {
+		return "", &os.PathError{Op: "sanitize", Path: p, Err: os.ErrInvalid}
+	}
+
+	return clean, nil
+}
+
 // wrapError wraps S3 errors to be compatible with os.IsNotExist and os.IsExist.
 func wrapError(op, path string, err error) error {
 	if err == nil {
@@ -98,7 +115,11 @@ func wrapError(op, path string, err error) error {
 // OpenFile opens a file in S3.
 // Note: S3 doesn't support traditional file flags, so this is a simplified implementation.
 func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if O_EXCL is set - file must not exist
 	if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
@@ -147,7 +168,7 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 	}
 
 	// For read operations, verify the file or directory exists
-	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+	_, err = fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
@@ -188,13 +209,17 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 
 // Mkdir creates a "directory" in S3 (creates a zero-byte object with trailing slash).
 func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return err
+	}
 	if !strings.HasSuffix(name, "/") {
 		name += "/"
 	}
 
 	// Check if directory already exists
-	_, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+	_, err = fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
@@ -221,10 +246,14 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 // For directories, it removes the directory marker (key with trailing slash).
 // Note: S3's DeleteObject succeeds even if the object doesn't exist.
 func (fs *FileSystem) Remove(name string) error {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return err
+	}
 
 	// First, try to remove as a file
-	_, err := fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+	_, err = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
@@ -248,13 +277,20 @@ func (fs *FileSystem) Remove(name string) error {
 
 // Rename renames (moves) a file in S3 by copying and deleting.
 func (fs *FileSystem) Rename(oldpath, newpath string) error {
-	oldpath = strings.TrimPrefix(oldpath, "/")
-	newpath = strings.TrimPrefix(newpath, "/")
+	var err error
+	oldpath, err = sanitizePath(oldpath)
+	if err != nil {
+		return err
+	}
+	newpath, err = sanitizePath(newpath)
+	if err != nil {
+		return err
+	}
 
 	// Copy object to new location
 	// Issue #13 fix: CopySource must be in format /bucket/key (with leading slash)
 	copySource := "/" + fs.bucket + "/" + oldpath
-	_, err := fs.client.CopyObject(fs.ctx, &s3.CopyObjectInput{
+	_, err = fs.client.CopyObject(fs.ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(fs.bucket),
 		CopySource: aws.String(copySource),
 		Key:        aws.String(newpath),
@@ -273,7 +309,11 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 
 // Stat returns file info for an S3 object.
 func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return nil, err
+	}
 
 	// Try the exact path first
 	output, err := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
@@ -329,7 +369,11 @@ func (fs *FileSystem) Chown(name string, uid, gid int) error {
 // Truncate truncates a file to the specified size.
 // For S3, this requires reading the file, truncating the data, and writing it back.
 func (fs *FileSystem) Truncate(name string, size int64) error {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return err
+	}
 
 	// Read the existing file content
 	output, err := fs.client.GetObject(fs.ctx, &s3.GetObjectInput{
@@ -396,7 +440,11 @@ func (fi *fileInfo) Info() (iosfs.FileInfo, error) {
 
 // ReadDir reads the named directory and returns a list of directory entries sorted by filename.
 func (fs *FileSystem) ReadDir(name string) ([]iosfs.DirEntry, error) {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return nil, err
+	}
 
 	// For root or empty, list with empty prefix
 	prefix := name
@@ -464,7 +512,11 @@ func (fs *FileSystem) ReadDir(name string) ([]iosfs.DirEntry, error) {
 
 // ReadFile reads the named file and returns its contents.
 func (fs *FileSystem) ReadFile(name string) ([]byte, error) {
-	name = strings.TrimPrefix(name, "/")
+	var err error
+	name, err = sanitizePath(name)
+	if err != nil {
+		return nil, err
+	}
 
 	output, err := fs.client.GetObject(fs.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(fs.bucket),

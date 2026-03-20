@@ -66,23 +66,80 @@ func TestPath_SpecialCharacters(t *testing.T) {
 }
 
 func TestPath_DotPaths(t *testing.T) {
-	fs, _ := newTestFS()
+	fs, mock := newTestFS()
 
-	// These paths should work (S3 doesn't interpret . and .. specially)
-	paths := []string{
-		"./current.txt",
-		"../parent.txt",
-		"dir/./file.txt",
-		"dir/../sibling.txt",
+	paths := []struct {
+		input    string
+		cleanKey string
+	}{
+		{"./current.txt", "current.txt"},
+		{"../parent.txt", "parent.txt"},
+		{"dir/./file.txt", "dir/file.txt"},
+		{"dir/../sibling.txt", "sibling.txt"},
 	}
 
-	for _, p := range paths {
-		f, err := fs.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0644)
+	for _, tc := range paths {
+		f, err := fs.OpenFile(tc.input, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
-			t.Errorf("OpenFile(%q) failed: %v", p, err)
+			t.Errorf("OpenFile(%q) failed: %v", tc.input, err)
 			continue
 		}
 		f.Close()
+
+		if !mock.HasObject(tc.cleanKey) {
+			t.Errorf("OpenFile(%q): expected object at clean key %q", tc.input, tc.cleanKey)
+		}
+	}
+}
+
+func TestSanitizePath_Traversal(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		ok    bool
+	}{
+		{"file.txt", "file.txt", true},
+		{"/file.txt", "file.txt", true},
+		{"./file.txt", "file.txt", true},
+		{"dir/../file.txt", "file.txt", true},
+		{"dir/./file.txt", "dir/file.txt", true},
+		{"../file.txt", "file.txt", true},
+		{"a/b/../c/d", "a/c/d", true},
+		{"a/b/c/../../d", "a/d", true},
+		{"dir with spaces/file.txt", "dir with spaces/file.txt", true},
+		{"", "", true},
+	}
+
+	for _, tc := range tests {
+		got, err := sanitizePath(tc.input)
+		if tc.ok && err != nil {
+			t.Errorf("sanitizePath(%q) unexpected error: %v", tc.input, err)
+		} else if !tc.ok && err == nil {
+			t.Errorf("sanitizePath(%q) expected error, got %q", tc.input, got)
+		} else if tc.ok && got != tc.want {
+			t.Errorf("sanitizePath(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizePath_AllOperations(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("safe.txt", []byte("data"))
+	mock.PutTestObject("safe/", []byte(""))
+
+	_, err := fs.Stat("./safe.txt")
+	if err != nil {
+		t.Errorf("Stat with dot path failed: %v", err)
+	}
+
+	_, err = fs.ReadFile("./safe.txt")
+	if err != nil {
+		t.Errorf("ReadFile with dot path failed: %v", err)
+	}
+
+	_, err = fs.ReadDir("./safe")
+	if err != nil {
+		t.Errorf("ReadDir with dot path failed: %v", err)
 	}
 }
 
