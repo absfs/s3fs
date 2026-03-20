@@ -783,3 +783,29 @@ func TestReadDir_Pagination_File(t *testing.T) {
 		t.Errorf("File.ReadDir returned %d entries, want 5 (across multiple pages)", len(entries))
 	}
 }
+
+// --- WithContext Tests (Issue #8) ---
+
+func TestWithContext(t *testing.T) {
+	mock := NewMockS3Client()
+	fs := NewWithClient(mock, "test-bucket")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fs2 := fs.WithContext(ctx)
+	if fs2 == nil {
+		t.Fatal("WithContext returned nil")
+	}
+
+	mock.PutTestObject("test.txt", []byte("data"))
+	_, err := fs.Stat("test.txt")
+	if err != nil {
+		t.Errorf("Original fs should still work: %v", err)
+	}
+
+	_, err = fs2.Stat("test.txt")
+	if err != nil {
+		t.Errorf("WithContext fs should work: %v", err)
+	}
+}
