@@ -28,18 +28,31 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
+// DefaultPartSize is the buffer threshold for switching to multipart upload.
+// S3 requires a minimum part size of 5MB for all parts except the last.
+const DefaultPartSize = 5 * 1024 * 1024 // 5MB
+
 // FileSystem implements absfs.Filer for S3 object storage.
 type FileSystem struct {
-	client S3Client
-	bucket string
-	ctx    context.Context
+	client   S3Client
+	bucket   string
+	ctx      context.Context
+	partSize int64 // multipart part size; 0 means DefaultPartSize
 }
 
 // Config contains the configuration for connecting to S3.
 type Config struct {
-	Bucket string      // S3 bucket name
-	Region string      // AWS region
-	Config *aws.Config // Optional AWS config (if nil, uses default config loading)
+	Bucket   string      // S3 bucket name
+	Region   string      // AWS region
+	Config   *aws.Config // Optional AWS config (if nil, uses default config loading)
+	PartSize int64       // Multipart upload part size (0 means DefaultPartSize)
+}
+
+func (fs *FileSystem) effectivePartSize() int64 {
+	if fs.partSize > 0 {
+		return fs.partSize
+	}
+	return DefaultPartSize
 }
 
 // New creates a new S3 filesystem with the given configuration.
@@ -62,9 +75,10 @@ func New(cfg *Config) (*FileSystem, error) {
 	client := s3.NewFromConfig(awsConfig)
 
 	return &FileSystem{
-		client: client,
-		bucket: cfg.Bucket,
-		ctx:    ctx,
+		client:   client,
+		bucket:   cfg.Bucket,
+		ctx:      ctx,
+		partSize: cfg.PartSize,
 	}, nil
 }
 
@@ -116,9 +130,10 @@ func sanitizePath(p string) (string, error) {
 // for all S3 operations.
 func (fs *FileSystem) WithContext(ctx context.Context) *FileSystem {
 	return &FileSystem{
-		client: fs.client,
-		bucket: fs.bucket,
-		ctx:    ctx,
+		client:   fs.client,
+		bucket:   fs.bucket,
+		ctx:      ctx,
+		partSize: fs.partSize,
 	}
 }
 

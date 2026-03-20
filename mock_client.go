@@ -17,8 +17,10 @@ import (
 
 // MockS3Client is an in-memory mock implementation of S3Client for testing.
 type MockS3Client struct {
-	mu      sync.RWMutex
-	objects map[string]*mockObject // key -> object
+	mu       sync.RWMutex
+	objects  map[string]*mockObject  // key -> object
+	uploads  map[string]*mockUpload  // uploadID -> upload
+	uploadID int                     // counter for generating upload IDs
 
 	// Error injection for testing failure scenarios
 	GetObjectErr    error
@@ -42,6 +44,11 @@ type MockS3Client struct {
 	CopyObjectCalls   []copyObjectCall
 	HeadObjectCalls   []string
 	ListObjectsCalls  []string
+}
+
+type mockUpload struct {
+	key   string
+	parts map[int32][]byte // partNumber -> data
 }
 
 type mockObject struct {
@@ -69,6 +76,8 @@ func (m *MockS3Client) Reset() {
 	defer m.mu.Unlock()
 
 	m.objects = make(map[string]*mockObject)
+	m.uploads = nil
+	m.uploadID = 0
 	m.GetObjectErr = nil
 	m.PutObjectErr = nil
 	m.DeleteObjectErr = nil
@@ -358,6 +367,94 @@ func (m *MockS3Client) ListObjectsV2(ctx context.Context, params *s3.ListObjects
 		KeyCount:              aws.Int32(int32(len(contents))),
 		NextContinuationToken: nextToken,
 	}, nil
+}
+
+// CreateMultipartUpload implements S3Client.
+func (m *MockS3Client) CreateMultipartUpload(ctx context.Context, params *s3.CreateMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.uploadID++
+	id := fmt.Sprintf("upload-%d", m.uploadID)
+
+	if m.uploads == nil {
+		m.uploads = make(map[string]*mockUpload)
+	}
+	m.uploads[id] = &mockUpload{
+		key:   aws.ToString(params.Key),
+		parts: make(map[int32][]byte),
+	}
+
+	return &s3.CreateMultipartUploadOutput{
+		UploadId: aws.String(id),
+	}, nil
+}
+
+// UploadPart implements S3Client.
+func (m *MockS3Client) UploadPart(ctx context.Context, params *s3.UploadPartInput, optFns ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id := aws.ToString(params.UploadId)
+	upload, ok := m.uploads[id]
+	if !ok {
+		return nil, fmt.Errorf("no such upload: %s", id)
+	}
+
+	data, err := io.ReadAll(params.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	partNum := aws.ToInt32(params.PartNumber)
+	upload.parts[partNum] = data
+
+	etag := fmt.Sprintf("etag-part-%d", partNum)
+	return &s3.UploadPartOutput{
+		ETag: aws.String(etag),
+	}, nil
+}
+
+// CompleteMultipartUpload implements S3Client.
+func (m *MockS3Client) CompleteMultipartUpload(ctx context.Context, params *s3.CompleteMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id := aws.ToString(params.UploadId)
+	upload, ok := m.uploads[id]
+	if !ok {
+		return nil, fmt.Errorf("no such upload: %s", id)
+	}
+
+	// Assemble parts in order
+	var assembled []byte
+	for i := int32(1); i <= int32(len(upload.parts)); i++ {
+		data, ok := upload.parts[i]
+		if !ok {
+			return nil, fmt.Errorf("missing part %d", i)
+		}
+		assembled = append(assembled, data...)
+	}
+
+	// Store as final object
+	m.objects[upload.key] = &mockObject{
+		data:         assembled,
+		lastModified: time.Now(),
+		contentType:  "application/octet-stream",
+	}
+
+	delete(m.uploads, id)
+	return &s3.CompleteMultipartUploadOutput{}, nil
+}
+
+// AbortMultipartUpload implements S3Client.
+func (m *MockS3Client) AbortMultipartUpload(ctx context.Context, params *s3.AbortMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id := aws.ToString(params.UploadId)
+	delete(m.uploads, id)
+	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
 // parseRange parses an HTTP range header value like "bytes=0-99".

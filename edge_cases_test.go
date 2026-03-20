@@ -3,6 +3,7 @@ package s3fs
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -807,5 +808,234 @@ func TestWithContext(t *testing.T) {
 	_, err = fs2.Stat("test.txt")
 	if err != nil {
 		t.Errorf("WithContext fs should work: %v", err)
+	}
+}
+
+// --- Multipart Upload Tests (Issue #15) ---
+
+func TestMultipart_LargeWrite(t *testing.T) {
+	mock := NewMockS3Client()
+	fs := NewWithClient(mock, "test-bucket")
+	fs.partSize = 100 // 100 bytes per part for testing
+
+	f, err := fs.OpenFile("large.bin", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	// Write 350 bytes - should trigger 3 parts (100+100+100) with 50 remaining
+	data := make([]byte, 350)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	_, err = f.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	file := f.(*File)
+	if file.multipartID == "" {
+		t.Error("Multipart upload should have been started")
+	}
+	if file.partNum != 3 {
+		t.Errorf("Expected 3 parts uploaded, got %d", file.partNum)
+	}
+	if len(file.buffer) != 50 {
+		t.Errorf("Remaining buffer should be 50 bytes, got %d", len(file.buffer))
+	}
+
+	err = f.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Verify assembled object
+	stored, ok := mock.GetTestObject("large.bin")
+	if !ok {
+		t.Fatal("Object should exist after multipart upload")
+	}
+	if len(stored) != 350 {
+		t.Errorf("Stored size = %d, want 350", len(stored))
+	}
+	for i, b := range stored {
+		if b != byte(i%256) {
+			t.Errorf("Data mismatch at byte %d: got %d, want %d", i, b, byte(i%256))
+			break
+		}
+	}
+}
+
+func TestMultipart_SmallWrite_NoParts(t *testing.T) {
+	mock := NewMockS3Client()
+	fs := NewWithClient(mock, "test-bucket")
+	fs.partSize = 1000 // 1KB threshold
+
+	f, err := fs.OpenFile("small.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	f.Write([]byte("small data"))
+	err = f.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Should use PutObject, not multipart
+	file := f.(*File)
+	if file.multipartID != "" {
+		t.Error("Small writes should not use multipart upload")
+	}
+
+	stored, ok := mock.GetTestObject("small.txt")
+	if !ok {
+		t.Fatal("Object should exist")
+	}
+	if string(stored) != "small data" {
+		t.Errorf("Content = %q, want %q", string(stored), "small data")
+	}
+}
+
+func TestMultipart_MultipleSmallWrites(t *testing.T) {
+	mock := NewMockS3Client()
+	fs := NewWithClient(mock, "test-bucket")
+	fs.partSize = 50
+
+	f, err := fs.OpenFile("chunked.bin", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	// Write in small chunks that accumulate past the part size
+	for i := 0; i < 10; i++ {
+		chunk := make([]byte, 20)
+		for j := range chunk {
+			chunk[j] = byte(i)
+		}
+		_, err := f.Write(chunk)
+		if err != nil {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+
+	err = f.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	stored, ok := mock.GetTestObject("chunked.bin")
+	if !ok {
+		t.Fatal("Object should exist")
+	}
+	if len(stored) != 200 {
+		t.Errorf("Stored size = %d, want 200", len(stored))
+	}
+}
+
+func TestMultipart_Truncate_AbortsUpload(t *testing.T) {
+	mock := NewMockS3Client()
+	fs := NewWithClient(mock, "test-bucket")
+	fs.partSize = 50
+
+	f, err := fs.OpenFile("trunc.bin", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	// Write enough to start multipart
+	f.Write(make([]byte, 100))
+
+	file := f.(*File)
+	if file.multipartID == "" {
+		t.Fatal("Multipart should have started")
+	}
+
+	// Truncate should abort multipart
+	f.Truncate(10)
+	if file.multipartID != "" {
+		t.Error("Truncate should abort multipart upload")
+	}
+	if len(file.buffer) != 10 {
+		t.Errorf("Buffer should be 10 bytes after truncate, got %d", len(file.buffer))
+	}
+
+	// Close should use PutObject since multipart was aborted
+	err = f.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	stored, ok := mock.GetTestObject("trunc.bin")
+	if !ok {
+		t.Fatal("Object should exist")
+	}
+	if len(stored) != 10 {
+		t.Errorf("Stored size = %d, want 10", len(stored))
+	}
+}
+
+// --- ReadAt Caching Tests (Issue #17) ---
+
+func TestReadAt_Cached(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("cached.txt", []byte("0123456789abcdef"))
+
+	f, err := fs.OpenFile("cached.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	// First ReadAt - fetches full object
+	buf := make([]byte, 3)
+	n, err := f.ReadAt(buf, 5)
+	if err != nil {
+		t.Fatalf("First ReadAt failed: %v", err)
+	}
+	if n != 3 || string(buf) != "567" {
+		t.Errorf("First ReadAt = %q, want %q", string(buf[:n]), "567")
+	}
+
+	// Second ReadAt - should use cache (only 1 GetObject call total)
+	buf2 := make([]byte, 4)
+	n, err = f.ReadAt(buf2, 10)
+	if err != nil {
+		t.Fatalf("Second ReadAt failed: %v", err)
+	}
+	if n != 4 || string(buf2) != "abcd" {
+		t.Errorf("Second ReadAt = %q, want %q", string(buf2[:n]), "abcd")
+	}
+
+	// Verify only 1 GetObject call was made (cached)
+	if len(mock.GetObjectCalls) != 1 {
+		t.Errorf("Expected 1 GetObject call, got %d (cache should prevent extra calls)", len(mock.GetObjectCalls))
+	}
+}
+
+func TestReadAt_EOF(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("short.txt", []byte("hi"))
+
+	f, err := fs.OpenFile("short.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	// Read past end
+	buf := make([]byte, 10)
+	n, err := f.ReadAt(buf, 0)
+	if n != 2 {
+		t.Errorf("ReadAt returned %d bytes, want 2", n)
+	}
+	if err != io.EOF {
+		t.Errorf("Expected io.EOF, got %v", err)
+	}
+
+	// Read at offset past end
+	n, err = f.ReadAt(buf, 100)
+	if n != 0 {
+		t.Errorf("ReadAt past end returned %d bytes, want 0", n)
+	}
+	if err != io.EOF {
+		t.Errorf("Expected io.EOF, got %v", err)
 	}
 }

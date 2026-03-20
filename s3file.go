@@ -2,7 +2,6 @@ package s3fs
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	iosfs "io/fs"
 	"os"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // File represents a file in S3.
@@ -26,6 +26,14 @@ type File struct {
 	buffer  []byte
 	offset  int64
 	body    io.ReadCloser
+
+	// Multipart upload state (issue #15)
+	multipartID string
+	parts       []types.CompletedPart
+	partNum     int32
+
+	// ReadAt cache (issue #17) - full object cached on first ReadAt
+	readCache []byte
 }
 
 // Name returns the name of the file.
@@ -58,8 +66,10 @@ func (f *File) Read(b []byte) (int, error) {
 	return f.body.Read(b)
 }
 
-// ReadAt reads from the S3 object at a specific offset using S3 range reads.
-// Each call issues a new GetObject request with the appropriate byte range.
+// ReadAt reads from the S3 object at a specific offset.
+// On first call, the full object is fetched and cached in memory for
+// efficient subsequent random access. For streaming reads of large files,
+// use [File.Read] instead.
 func (f *File) ReadAt(b []byte, off int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -68,23 +78,38 @@ func (f *File) ReadAt(b []byte, off int64) (int, error) {
 		return 0, os.ErrInvalid
 	}
 
-	rangeStr := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(b))-1)
-	output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
-		Bucket: aws.String(f.fs.bucket),
-		Key:    aws.String(f.key),
-		Range:  aws.String(rangeStr),
-	})
-	if err != nil {
-		return 0, wrapError("read", f.name, err)
-	}
-	defer output.Body.Close()
+	// Cache full object on first ReadAt call
+	if f.readCache == nil {
+		output, err := f.fs.client.GetObject(f.fs.ctx, &s3.GetObjectInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.key),
+		})
+		if err != nil {
+			return 0, wrapError("read", f.name, err)
+		}
+		defer output.Body.Close()
 
-	return io.ReadFull(output.Body, b)
+		data, err := io.ReadAll(output.Body)
+		if err != nil {
+			return 0, wrapError("read", f.name, err)
+		}
+		f.readCache = data
+	}
+
+	if off >= int64(len(f.readCache)) {
+		return 0, io.EOF
+	}
+
+	n := copy(b, f.readCache[off:])
+	if n < len(b) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 // Write writes to the file buffer. The buffer is uploaded to S3 on Close.
-// In append mode, writes always go to the end of the buffer regardless of
-// the current offset.
+// For large writes, multipart upload is used automatically when the buffer
+// exceeds the configured part size (default 5MB).
 func (f *File) Write(b []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -95,7 +120,77 @@ func (f *File) Write(b []byte) (int, error) {
 
 	f.buffer = append(f.buffer, b...)
 	f.offset = int64(len(f.buffer))
+
+	// Flush parts if buffer exceeds part size
+	if err := f.flushPartsLocked(); err != nil {
+		return 0, wrapError("write", f.name, err)
+	}
+
 	return len(b), nil
+}
+
+// flushPartsLocked flushes complete parts from the buffer via multipart upload.
+// Must be called with f.mu held.
+func (f *File) flushPartsLocked() error {
+	partSize := f.fs.effectivePartSize()
+	if int64(len(f.buffer)) < partSize {
+		return nil
+	}
+
+	// Start multipart upload if not already started
+	if f.multipartID == "" {
+		output, err := f.fs.client.CreateMultipartUpload(f.fs.ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(f.fs.bucket),
+			Key:    aws.String(f.key),
+		})
+		if err != nil {
+			return err
+		}
+		f.multipartID = aws.ToString(output.UploadId)
+	}
+
+	// Upload complete parts
+	for int64(len(f.buffer)) >= partSize {
+		f.partNum++
+		part := f.buffer[:partSize]
+		f.buffer = f.buffer[partSize:]
+
+		output, err := f.fs.client.UploadPart(f.fs.ctx, &s3.UploadPartInput{
+			Bucket:     aws.String(f.fs.bucket),
+			Key:        aws.String(f.key),
+			UploadId:   aws.String(f.multipartID),
+			PartNumber: aws.Int32(f.partNum),
+			Body:       bytes.NewReader(part),
+		})
+		if err != nil {
+			// Abort on failure
+			f.abortMultipartLocked()
+			return err
+		}
+
+		f.parts = append(f.parts, types.CompletedPart{
+			ETag:       output.ETag,
+			PartNumber: aws.Int32(f.partNum),
+		})
+	}
+
+	return nil
+}
+
+// abortMultipartLocked aborts an active multipart upload.
+// Must be called with f.mu held.
+func (f *File) abortMultipartLocked() {
+	if f.multipartID == "" {
+		return
+	}
+	_, _ = f.fs.client.AbortMultipartUpload(f.fs.ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(f.fs.bucket),
+		Key:      aws.String(f.key),
+		UploadId: aws.String(f.multipartID),
+	})
+	f.multipartID = ""
+	f.parts = nil
+	f.partNum = 0
 }
 
 // WriteAt writes to the buffer at a specific offset.
@@ -125,7 +220,8 @@ func (f *File) WriteString(s string) (int, error) {
 }
 
 // Close closes the file. For files opened for writing, the buffered content
-// is uploaded to S3.
+// is uploaded to S3. If a multipart upload is in progress, the remaining
+// buffer is uploaded as the final part and the upload is completed.
 func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -134,16 +230,53 @@ func (f *File) Close() error {
 		f.body.Close()
 	}
 
-	if f.writing {
-		_, err := f.fs.client.PutObject(f.fs.ctx, &s3.PutObjectInput{
-			Bucket: aws.String(f.fs.bucket),
-			Key:    aws.String(f.key),
-			Body:   bytes.NewReader(f.buffer),
-		})
-		return wrapError("close", f.name, err)
+	if !f.writing {
+		return nil
 	}
 
-	return nil
+	// Multipart path: upload final part and complete
+	if f.multipartID != "" {
+		if len(f.buffer) > 0 || f.partNum == 0 {
+			f.partNum++
+			output, err := f.fs.client.UploadPart(f.fs.ctx, &s3.UploadPartInput{
+				Bucket:     aws.String(f.fs.bucket),
+				Key:        aws.String(f.key),
+				UploadId:   aws.String(f.multipartID),
+				PartNumber: aws.Int32(f.partNum),
+				Body:       bytes.NewReader(f.buffer),
+			})
+			if err != nil {
+				f.abortMultipartLocked()
+				return wrapError("close", f.name, err)
+			}
+			f.parts = append(f.parts, types.CompletedPart{
+				ETag:       output.ETag,
+				PartNumber: aws.Int32(f.partNum),
+			})
+		}
+
+		_, err := f.fs.client.CompleteMultipartUpload(f.fs.ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   aws.String(f.fs.bucket),
+			Key:      aws.String(f.key),
+			UploadId: aws.String(f.multipartID),
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: f.parts,
+			},
+		})
+		if err != nil {
+			f.abortMultipartLocked()
+			return wrapError("close", f.name, err)
+		}
+		return nil
+	}
+
+	// Simple path: single PutObject
+	_, err := f.fs.client.PutObject(f.fs.ctx, &s3.PutObjectInput{
+		Bucket: aws.String(f.fs.bucket),
+		Key:    aws.String(f.key),
+		Body:   bytes.NewReader(f.buffer),
+	})
+	return wrapError("close", f.name, err)
 }
 
 // Seek sets the offset for the next read or write.
@@ -174,6 +307,8 @@ func (f *File) Sync() error {
 }
 
 // Truncate changes the size of the file buffer. It does not change the I/O offset.
+// If a multipart upload is in progress, it is aborted since already-uploaded
+// parts cannot be truncated.
 func (f *File) Truncate(size int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -181,6 +316,10 @@ func (f *File) Truncate(size int64) error {
 	if !f.writing {
 		return os.ErrInvalid
 	}
+
+	// Abort any in-progress multipart upload since we can't truncate
+	// already-uploaded parts
+	f.abortMultipartLocked()
 
 	if size < int64(len(f.buffer)) {
 		f.buffer = f.buffer[:size]
