@@ -210,10 +210,13 @@ func TestRemove_ExistingFile(t *testing.T) {
 func TestRemove_NonExistentFile(t *testing.T) {
 	fs, _ := newTestFS()
 
-	// S3 DeleteObject returns success even for non-existent objects
+	// Remove should return an error for non-existent files (os.Remove semantics)
 	err := fs.Remove("does-not-exist.txt")
-	if err != nil {
-		t.Errorf("Remove should succeed for non-existent file (S3 behavior): %v", err)
+	if err == nil {
+		t.Error("Expected error when removing non-existent file")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("Expected os.ErrNotExist, got: %v", err)
 	}
 }
 

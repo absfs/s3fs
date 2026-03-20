@@ -252,7 +252,38 @@ func (fs *FileSystem) Remove(name string) error {
 		return err
 	}
 
-	// First, try to remove as a file
+	// Check if the object exists as a file
+	_, headErr := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(name),
+	})
+
+	// If not a file, check as directory marker
+	dirKey := name
+	if !strings.HasSuffix(dirKey, "/") {
+		dirKey += "/"
+	}
+	isDirMarker := false
+	if headErr != nil {
+		_, dirErr := fs.client.HeadObject(fs.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(dirKey),
+		})
+		if dirErr != nil {
+			return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
+		}
+		isDirMarker = true
+	}
+
+	if isDirMarker {
+		_, err = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(dirKey),
+		})
+		return wrapError("remove", name, err)
+	}
+
+	// Delete the file
 	_, err = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
@@ -261,15 +292,12 @@ func (fs *FileSystem) Remove(name string) error {
 		return wrapError("remove", name, err)
 	}
 
-	// Also try to remove as a directory marker (with trailing slash)
-	// This handles the case where we're removing an empty directory
+	// Also clean up directory marker if present
 	if !strings.HasSuffix(name, "/") {
-		dirKey := name + "/"
 		_, _ = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(fs.bucket),
 			Key:    aws.String(dirKey),
 		})
-		// Ignore errors for directory marker deletion
 	}
 
 	return nil
