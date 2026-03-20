@@ -6,8 +6,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// S3Client defines the interface for S3 operations used by FileSystem.
-// This interface allows for dependency injection and mock testing.
+// S3Client defines the subset of the S3 API used by [FileSystem].
+// Both [s3.Client] and [MockS3Client] satisfy this interface.
 type S3Client interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)

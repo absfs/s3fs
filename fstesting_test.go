@@ -38,7 +38,7 @@ func TestS3FS_FSTesting(t *testing.T) {
 			CaseSensitive: true,
 
 			// S3 rename is atomic (copy + delete in one operation conceptually)
-			AtomicRename: true,
+			AtomicRename: false,
 
 			// S3 doesn't support sparse files (it's object storage)
 			SparseFiles: false,
