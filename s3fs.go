@@ -356,7 +356,16 @@ func (fs *FileSystem) Rename(oldpath, newpath string) error {
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(oldpath),
 	})
-	return wrapError("rename", oldpath, err)
+	if err != nil {
+		// Rollback: delete the copy we just made
+		_, _ = fs.client.DeleteObject(fs.ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(fs.bucket),
+			Key:    aws.String(newpath),
+		})
+		return wrapError("rename", oldpath, err)
+	}
+
+	return nil
 }
 
 // Stat returns file info for an S3 object.

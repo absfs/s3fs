@@ -682,3 +682,29 @@ func TestOpenFile_WriteWithoutTrunc(t *testing.T) {
 		t.Errorf("Buffer should contain existing content %q, got %q", "original", string(file.buffer))
 	}
 }
+
+// --- Rename Rollback Tests (Issue #3) ---
+
+func TestRename_DeleteError_RollsBack(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("src.txt", []byte("data"))
+
+	// Only the source key delete fails; rollback delete of dst.txt should succeed
+	mock.DeleteObjectKeyErrs = map[string]error{
+		"src.txt": errors.New("delete failed"),
+	}
+
+	err := fs.Rename("src.txt", "dst.txt")
+	if err == nil {
+		t.Error("Expected error from Rename when delete fails")
+	}
+
+	if !mock.HasObject("src.txt") {
+		t.Error("Source should still exist when delete fails")
+	}
+
+	// Rollback should have deleted the copy
+	if mock.HasObject("dst.txt") {
+		t.Error("Rollback should have deleted dst.txt")
+	}
+}

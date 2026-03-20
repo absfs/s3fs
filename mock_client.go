@@ -27,6 +27,9 @@ type MockS3Client struct {
 	HeadObjectErr   error
 	ListObjectsErr  error
 
+	// Per-key error injection for DeleteObject (checked before global DeleteObjectErr)
+	DeleteObjectKeyErrs map[string]error
+
 	// Call tracking for assertions
 	GetObjectCalls    []string
 	PutObjectCalls    []string
@@ -64,6 +67,7 @@ func (m *MockS3Client) Reset() {
 	m.GetObjectErr = nil
 	m.PutObjectErr = nil
 	m.DeleteObjectErr = nil
+	m.DeleteObjectKeyErrs = nil
 	m.CopyObjectErr = nil
 	m.HeadObjectErr = nil
 	m.ListObjectsErr = nil
@@ -195,6 +199,9 @@ func (m *MockS3Client) DeleteObject(ctx context.Context, params *s3.DeleteObject
 	m.DeleteObjectCalls = append(m.DeleteObjectCalls, key)
 	m.mu.Unlock()
 
+	if keyErr, ok := m.DeleteObjectKeyErrs[key]; ok {
+		return nil, keyErr
+	}
 	if m.DeleteObjectErr != nil {
 		return nil, m.DeleteObjectErr
 	}

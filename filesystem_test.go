@@ -341,9 +341,9 @@ func TestRename_DeleteError(t *testing.T) {
 		t.Error("Expected error from Rename when delete fails")
 	}
 
-	// Both objects may exist (copy succeeded, delete failed)
-	if !mock.HasObject("dst.txt") {
-		t.Error("Destination should exist after copy")
+	// Source should still exist since delete failed
+	if !mock.HasObject("src.txt") {
+		t.Error("Source should still exist when delete fails")
 	}
 }
 
