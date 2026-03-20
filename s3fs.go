@@ -153,18 +153,42 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 			Key:    aws.String(dirKey),
 		})
 		if err == nil {
-			// Directory exists
 			_ = output
 			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrInvalid}
 		}
 
-		return &File{
+		var buf []byte
+
+		// Load existing content unless O_TRUNC is set
+		if flag&os.O_TRUNC == 0 {
+			getOutput, getErr := fs.client.GetObject(fs.ctx, &s3.GetObjectInput{
+				Bucket: aws.String(fs.bucket),
+				Key:    aws.String(name),
+			})
+			if getErr == nil {
+				buf, _ = io.ReadAll(getOutput.Body)
+				getOutput.Body.Close()
+			}
+		}
+
+		if buf == nil {
+			buf = []byte{}
+		}
+
+		f := &File{
 			fs:      fs,
 			name:    name,
 			key:     name,
 			writing: true,
-			buffer:  []byte{},
-		}, nil
+			buffer:  buf,
+		}
+
+		if flag&os.O_APPEND != 0 {
+			f.append = true
+			f.offset = int64(len(buf))
+		}
+
+		return f, nil
 	}
 
 	// For read operations, verify the file or directory exists

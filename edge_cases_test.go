@@ -593,3 +593,92 @@ func TestConcurrency_SameFileWrite(t *testing.T) {
 		t.Errorf("Expected 100 bytes written, got %d", len(data))
 	}
 }
+
+// --- O_TRUNC and O_APPEND Tests (Issue #5) ---
+
+func TestOpenFile_O_TRUNC(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("existing.txt", []byte("original content"))
+
+	f, err := fs.OpenFile("existing.txt", os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile with O_TRUNC failed: %v", err)
+	}
+
+	file := f.(*File)
+	if len(file.buffer) != 0 {
+		t.Errorf("O_TRUNC buffer should be empty, got %d bytes", len(file.buffer))
+	}
+
+	f.Write([]byte("new"))
+	f.Close()
+
+	data, _ := mock.GetTestObject("existing.txt")
+	if string(data) != "new" {
+		t.Errorf("After O_TRUNC write, content = %q, want %q", string(data), "new")
+	}
+}
+
+func TestOpenFile_O_APPEND(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("existing.txt", []byte("hello"))
+
+	f, err := fs.OpenFile("existing.txt", os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile with O_APPEND failed: %v", err)
+	}
+
+	file := f.(*File)
+	if string(file.buffer) != "hello" {
+		t.Errorf("O_APPEND buffer = %q, want %q", string(file.buffer), "hello")
+	}
+	if !file.append {
+		t.Error("O_APPEND should set append flag")
+	}
+	if file.offset != 5 {
+		t.Errorf("O_APPEND offset = %d, want 5", file.offset)
+	}
+
+	f.Write([]byte(" world"))
+	f.Close()
+
+	data, _ := mock.GetTestObject("existing.txt")
+	if string(data) != "hello world" {
+		t.Errorf("After O_APPEND write, content = %q, want %q", string(data), "hello world")
+	}
+}
+
+func TestOpenFile_O_APPEND_NewFile(t *testing.T) {
+	fs, mock := newTestFS()
+
+	f, err := fs.OpenFile("new.txt", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile with O_APPEND|O_CREATE failed: %v", err)
+	}
+
+	f.Write([]byte("content"))
+	f.Close()
+
+	data, ok := mock.GetTestObject("new.txt")
+	if !ok {
+		t.Fatal("File should exist after write")
+	}
+	if string(data) != "content" {
+		t.Errorf("Content = %q, want %q", string(data), "content")
+	}
+}
+
+func TestOpenFile_WriteWithoutTrunc(t *testing.T) {
+	fs, mock := newTestFS()
+	mock.PutTestObject("existing.txt", []byte("original"))
+
+	f, err := fs.OpenFile("existing.txt", os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	file := f.(*File)
+	if string(file.buffer) != "original" {
+		t.Errorf("Buffer should contain existing content %q, got %q", "original", string(file.buffer))
+	}
+}

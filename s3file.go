@@ -22,6 +22,7 @@ type File struct {
 	name    string
 	key     string
 	writing bool
+	append  bool
 	buffer  []byte
 	offset  int64
 	body    io.ReadCloser
@@ -90,7 +91,7 @@ func (f *File) Write(b []byte) (int, error) {
 	}
 
 	f.buffer = append(f.buffer, b...)
-	f.offset += int64(len(b))
+	f.offset = int64(len(f.buffer))
 	return len(b), nil
 }
 
